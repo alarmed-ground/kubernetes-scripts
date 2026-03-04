@@ -123,6 +123,33 @@ EOS
     echo "========== DONE $NODE =========="
   done
 }
+
+configure_k8s_kernel() {
+
+  echo "Configuring kernel modules for Kubernetes..."
+
+  # Load required modules immediately
+  sudo modprobe overlay
+  sudo modprobe br_netfilter
+
+  # Persist modules
+  cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+  echo "Configuring sysctl settings..."
+
+  cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+
+  sudo sysctl --system
+
+  echo "Kernel configuration complete."
+}
 ############################################
 # NVIDIA Local
 ############################################
@@ -147,7 +174,7 @@ install_control_plane() {
     echo "Cluster already exists."
     return
   fi
-
+  configure_k8s_kernel
   sudo swapoff -a
   sudo sed -i '/ swap / s/^/#/' /etc/fstab
 
@@ -340,6 +367,88 @@ single_node_poc(){
 }
 
 ############################################
+# Uninstall Entire Kubernetes Cluster
+############################################
+uninstall_cluster() {
+
+  echo "⚠ WARNING: This will REMOVE the entire Kubernetes cluster."
+  read -rp "Are you sure? (yes/no): " CONFIRM
+  [[ "$CONFIRM" != "yes" ]] && echo "Cancelled." && return
+
+  echo "Removing Helm releases (if present)..."
+
+  helm uninstall grafana -n monitoring 2>/dev/null || true
+  helm uninstall prometheus -n monitoring 2>/dev/null || true
+  helm uninstall gpu-operator -n gpu-operator 2>/dev/null || true
+  helm uninstall nfs-provisioner -n nfs-storage 2>/dev/null || true
+
+  echo "Deleting namespaces..."
+  kubectl delete ns monitoring --ignore-not-found
+  kubectl delete ns gpu-operator --ignore-not-found
+  kubectl delete ns nfs-storage --ignore-not-found
+
+  echo "Resetting control plane..."
+  sudo kubeadm reset -f || true
+
+  echo "Removing Kubernetes packages..."
+  sudo apt purge -y kubeadm kubelet kubectl kubernetes-cni || true
+  sudo apt autoremove -y
+
+  echo "Stopping kubelet..."
+  sudo systemctl stop kubelet || true
+  sudo systemctl disable kubelet || true
+
+  echo "Removing CNI configs..."
+  sudo rm -rf /etc/cni/net.d
+  sudo rm -rf /var/lib/cni/
+  sudo rm -rf /var/lib/kubelet/
+  sudo rm -rf /etc/kubernetes/
+  sudo rm -rf $HOME/.kube
+
+  echo "Flushing iptables..."
+  sudo iptables -F
+  sudo iptables -X
+  sudo iptables -t nat -F
+  sudo iptables -t nat -X
+  sudo iptables -t mangle -F
+  sudo iptables -t mangle -X
+
+  echo "Restarting containerd..."
+  sudo systemctl restart containerd || true
+
+  echo "Cluster removal complete on control plane."
+
+  read -rp "Do you want to uninstall worker nodes as well? (yes/no): " REMOVE_WORKERS
+
+  if [[ "$REMOVE_WORKERS" == "yes" ]]; then
+    read -rp "Worker IPs (space separated): " WORKERS
+    read -rp "SSH username: " SSH_USER
+
+    for NODE in $WORKERS; do
+      echo "Removing Kubernetes from $NODE"
+
+      ssh ${SSH_USER}@${NODE} <<'EOF'
+sudo kubeadm reset -f || true
+sudo apt purge -y kubeadm kubelet kubectl kubernetes-cni || true
+sudo apt autoremove -y
+sudo rm -rf /etc/cni/net.d
+sudo rm -rf /var/lib/cni/
+sudo rm -rf /var/lib/kubelet/
+sudo rm -rf /etc/kubernetes/
+sudo iptables -F
+sudo iptables -t nat -F
+sudo iptables -t mangle -F
+sudo systemctl restart containerd || true
+EOF
+
+      echo "$NODE cleaned."
+    done
+  fi
+
+  echo "Kubernetes cluster fully removed."
+}
+
+############################################
 # Menu
 ############################################
 while true; do
@@ -355,12 +464,11 @@ while true; do
   echo "9) Install Prometheus"
   echo "10) Install Grafana"
   echo "11) Untaint Control Plane"
-  echo "12) Exit"
-  echo ""
+  echo "12) Uninstall Entire Cluster"
+  echo "13) Exit"
+read -rp "Select option: " opt
 
-  read -rp "Select option: " opt
-
-  case $opt in
+case $opt in
     1) single_node_poc ;;
     2) setup_ssh ;;
     3) install_nvidia_workers ;;
@@ -372,7 +480,8 @@ while true; do
     9) install_prometheus ;;
     10) install_grafana ;;
     11) untaint_control_plane ;;
-    12) break ;;
+    12) uninstall_cluster ;;
+    13) break ;;
     *) echo "Invalid option" ;;
   esac
 
