@@ -45,6 +45,30 @@ dashboard() {
   printf "] %d%%\n" "$percent"
   echo "======================================================"
 }
+######################################################################
+#####SSH SETUP####
+######################################################################
+setup_ssh() {
+  read -rp "Worker IPs (space separated): " WORKERS
+  read -rp "SSH username: " SSH_USER
+
+  if [[ ! -f ~/.ssh/id_rsa ]]; then
+    ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa
+  fi
+
+  for NODE in $WORKERS; do
+    echo "Setting up SSH for $NODE"
+    ssh-copy-id ${SSH_USER}@${NODE}
+
+    echo "Configuring passwordless sudo on $NODE"
+    ssh -t ${SSH_USER}@${NODE} "
+      echo '${SSH_USER} ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/99-${SSH_USER} &&
+      sudo chmod 440 /etc/sudoers.d/99-${SSH_USER}
+    "
+  done
+
+  echo "SSH and sudo configuration completed."
+}
 
 ############################################
 # Ubuntu 24.04 Prereqs
@@ -289,27 +313,29 @@ uninstall_cluster() {
 while true; do
   echo ""
   echo "1) Install Control Plane"
-  echo "2) Generate Join Command"
-  echo "3) Parallel Worker Provision"
-  echo "4) Parallel NVIDIA Install + Dashboard"
-  echo "5) Install GPU Operator"
-  echo "6) Install Prometheus"
-  echo "7) Install Grafana"
-  echo "8) Uninstall Cluster"
-  echo "9) Exit"
+  echo "2) Setup SSH and Passwordless login"
+  echo "3) Generate Join Command"
+  echo "4) Parallel Worker Provision"
+  echo "5) Parallel NVIDIA Install + Dashboard"
+  echo "6) Install GPU Operator"
+  echo "7) Install Prometheus"
+  echo "8) Install Grafana"
+  echo "9) Uninstall Cluster"
+  echo "10) Exit"
   echo ""
 
   read -rp "Select: " opt
 
   case $opt in
     1) install_control_plane ;;
-    2) generate_join ;;
-    3) bootstrap_workers_parallel ;;
-    4) install_nvidia_parallel ;;
-    5) install_gpu_operator ;;
-    6) install_prometheus ;;
-    7) install_grafana ;;
-    8) uninstall_cluster ;;
-    9) exit 0 ;;
+    2) setup_ssh ;;
+    3) generate_join ;;
+    4) bootstrap_workers_parallel ;;
+    5) install_nvidia_parallel ;;
+    6) install_gpu_operator ;;
+    7) install_prometheus ;;
+    8) install_grafana ;;
+    9) uninstall_cluster ;;
+    10) exit 0 ;;
   esac
 done
