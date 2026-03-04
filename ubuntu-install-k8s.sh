@@ -50,6 +50,7 @@ dashboard() {
 # Ubuntu 24.04 Prereqs
 ############################################
 configure_prereqs() {
+  sudo apt install curl ethtool nload ipmitool smartmontools git
   sudo swapoff -a || true
   sudo sed -i '/ swap / s/^/#/' /etc/fstab || true
 
