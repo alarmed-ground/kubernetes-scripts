@@ -15,40 +15,64 @@ K8S_VERSION="1.29"
 POD_CIDR="192.168.0.0/16"
 declare -A NODE_STATUS
 declare -A NODE_GPU
+declare -A NODE_GPUMODEL
 TOTAL_NODES=0
 COMPLETED=0
-
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+BLUE="\e[34m"
+CYAN="\e[36m"
+RESET="\e[0m"
 ############################################
 # Dashboard UI
 ############################################
 dashboard() {
   clear
-  echo "================================================================================"
-  echo "                 GPU CLUSTER PROVISIONING DASHBOARD"
-  echo "================================================================================"
-  printf "%-16s %-15s %-8s %-40s\n" "NODE" "STATUS" "GPU" "LAST LOG"
-  echo "--------------------------------------------------------------------------------"
+  echo -e "${CYAN}================================================================================${RESET}"
+  echo -e "${CYAN}            GPU CLUSTER PROVISIONING DASHBOARD${RESET}"
+  echo -e "${CYAN}================================================================================${RESET}"
+
+  printf "%-15s %-15s %-8s %-22s %-35s\n" \
+    "NODE" "STATUS" "GPU" "GPU MODEL" "LAST LOG"
+
+  echo "----------------------------------------------------------------------------------------------"
 
   for NODE in "${!NODE_STATUS[@]}"; do
+
+    STATUS="${NODE_STATUS[$NODE]}"
+    GPU="${NODE_GPU[$NODE]:-N/A}"
+    MODEL="${NODE_GPUMODEL[$NODE]:-N/A}"
     LAST="${NODE_LASTLOG[$NODE]:-Waiting...}"
-    printf "%-16s %-15s %-8s %-40s\n" \
-      "$NODE" \
-      "${NODE_STATUS[$NODE]}" \
-      "${NODE_GPU[$NODE]:-N/A}" \
-      "${LAST:0:40}"
+
+    # Color status
+    case "$STATUS" in
+      INSTALLING) COLOR=$BLUE ;;
+      REBOOTING) COLOR=$YELLOW ;;
+      GPU_OK) COLOR=$GREEN ;;
+      GPU_FAIL) COLOR=$RED ;;
+      QUEUED) COLOR=$CYAN ;;
+      *) COLOR=$RESET ;;
+    esac
+
+    printf "%-15s ${COLOR}%-15s${RESET} %-8s %-22s %-35s\n" \
+      "$NODE" "$STATUS" "$GPU" "${MODEL:0:22}" "${LAST:0:35}"
   done
 
-  echo "--------------------------------------------------------------------------------"
-  echo "Progress: $COMPLETED / $TOTAL_NODES"
+  echo "----------------------------------------------------------------------------------------------"
+
   percent=0
   [[ $TOTAL_NODES -gt 0 ]] && percent=$((COMPLETED*100/TOTAL_NODES))
   filled=$((percent/2))
   empty=$((50-filled))
+
+  printf "Progress: %d / %d\n" "$COMPLETED" "$TOTAL_NODES"
   printf "["
   printf "%0.s#" $(seq 1 $filled 2>/dev/null)
   printf "%0.s-" $(seq 1 $empty 2>/dev/null)
   printf "] %d%%\n" "$percent"
-  echo "================================================================================"
+
+  echo -e "${CYAN}================================================================================${RESET}"
 }
 ######################################################################
 #####SSH SETUP####
@@ -288,15 +312,21 @@ EOF
     done
 
     if ssh ${SSH_USER}@${NODE} "nvidia-smi" >/dev/null 2>&1; then
-      NODE_STATUS[$NODE]="GPU_OK"
-      NODE_GPU[$NODE]="YES"
-      NODE_LASTLOG[$NODE]="Driver verified"
-    else
-      NODE_STATUS[$NODE]="GPU_FAIL"
-      NODE_GPU[$NODE]="NO"
-      NODE_LASTLOG[$NODE]="Verification failed"
-    fi
 
+  MODEL=$(ssh ${SSH_USER}@${NODE} \
+    "nvidia-smi --query-gpu=name --format=csv,noheader | head -n1")
+
+  NODE_STATUS[$NODE]="GPU_OK"
+  NODE_GPU[$NODE]="YES"
+  NODE_GPUMODEL[$NODE]="$MODEL"
+  NODE_LASTLOG[$NODE]="Driver verified"
+
+else
+  NODE_STATUS[$NODE]="GPU_FAIL"
+  NODE_GPU[$NODE]="NO"
+  NODE_GPUMODEL[$NODE]="-"
+  NODE_LASTLOG[$NODE]="Verification failed"
+fi
     ((COMPLETED++))
     dashboard
   }
