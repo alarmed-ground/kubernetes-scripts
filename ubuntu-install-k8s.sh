@@ -23,17 +23,22 @@ COMPLETED=0
 ############################################
 dashboard() {
   clear
-  echo "======================================================"
-  echo "        KUBERNETES GPU CLUSTER PROVISIONING"
-  echo "======================================================"
-  printf "%-18s %-15s %-10s\n" "NODE" "STATUS" "GPU"
-  echo "------------------------------------------------------"
+  echo "================================================================================"
+  echo "                 GPU CLUSTER PROVISIONING DASHBOARD"
+  echo "================================================================================"
+  printf "%-16s %-15s %-8s %-40s\n" "NODE" "STATUS" "GPU" "LAST LOG"
+  echo "--------------------------------------------------------------------------------"
 
   for NODE in "${!NODE_STATUS[@]}"; do
-    printf "%-18s %-15s %-10s\n" "$NODE" "${NODE_STATUS[$NODE]}" "${NODE_GPU[$NODE]:-N/A}"
+    LAST="${NODE_LASTLOG[$NODE]:-Waiting...}"
+    printf "%-16s %-15s %-8s %-40s\n" \
+      "$NODE" \
+      "${NODE_STATUS[$NODE]}" \
+      "${NODE_GPU[$NODE]:-N/A}" \
+      "${LAST:0:40}"
   done
 
-  echo "------------------------------------------------------"
+  echo "--------------------------------------------------------------------------------"
   echo "Progress: $COMPLETED / $TOTAL_NODES"
   percent=0
   [[ $TOTAL_NODES -gt 0 ]] && percent=$((COMPLETED*100/TOTAL_NODES))
@@ -43,7 +48,7 @@ dashboard() {
   printf "%0.s#" $(seq 1 $filled 2>/dev/null)
   printf "%0.s-" $(seq 1 $empty 2>/dev/null)
   printf "] %d%%\n" "$percent"
-  echo "======================================================"
+  echo "================================================================================"
 }
 ######################################################################
 #####SSH SETUP####
@@ -206,34 +211,90 @@ install_nvidia_parallel() {
   read -rp "Max parallel [5]: " MAX
   MAX=${MAX:-5}
 
+  mkdir -p /var/log/k8s-nvidia
+
   TOTAL_NODES=$(echo $WORKERS | wc -w)
   COMPLETED=0
 
   install_node() {
+
     NODE=$1
+    LOG_FILE="/var/log/k8s-nvidia/${NODE}.log"
+
     NODE_STATUS[$NODE]="INSTALLING"
+    NODE_LASTLOG[$NODE]="Starting..."
     dashboard
 
-    ssh ${SSH_USER}@${NODE} "
-      if command -v nvidia-smi >/dev/null 2>&1; then exit 0; fi
-      sudo apt update
-      sudo apt install -y ubuntu-drivers-common linux-headers-\$(uname -r)
-      DRIVER=\$(ubuntu-drivers devices | awk '/recommended/ {print \$3}')
-      sudo apt install -y \$DRIVER
-      sudo reboot
-    " >/dev/null 2>&1 || true
+    # Push remote installer
+    ssh ${SSH_USER}@${NODE} "cat > /tmp/install_nvidia.sh" << 'EOF'
+#!/bin/bash
+set -e
+export DEBIAN_FRONTEND=noninteractive
+
+echo "Checking existing driver..."
+if command -v nvidia-smi >/dev/null 2>&1; then
+  echo "Driver already installed"
+  exit 0
+fi
+
+echo "Updating apt..."
+sudo apt update
+
+echo "Installing headers..."
+sudo apt install -y ubuntu-drivers-common linux-headers-$(uname -r)
+
+echo "Detecting recommended driver..."
+DRIVER=$(ubuntu-drivers devices | awk '/recommended/ {print $3}')
+
+if [ -z "$DRIVER" ]; then
+  echo "No recommended driver found"
+  exit 1
+fi
+
+echo "Installing $DRIVER..."
+sudo apt install -y $DRIVER
+
+echo "Rebooting..."
+sudo reboot
+EOF
+
+    # Execute installer and log output
+    ssh ${SSH_USER}@${NODE} "bash /tmp/install_nvidia.sh" \
+      > "$LOG_FILE" 2>&1 &
+
+    PID=$!
+
+    # Monitor log file live
+    while kill -0 $PID 2>/dev/null; do
+      if [[ -f "$LOG_FILE" ]]; then
+        NODE_LASTLOG[$NODE]=$(tail -n 1 "$LOG_FILE")
+      fi
+      dashboard
+      sleep 2
+    done
+
+    wait $PID || true
+
+    NODE_STATUS[$NODE]="REBOOTING"
+    NODE_LASTLOG[$NODE]="Waiting for reboot..."
+    dashboard
 
     sleep 10
+
     until ssh -o ConnectTimeout=5 ${SSH_USER}@${NODE} "echo up" >/dev/null 2>&1; do
       sleep 5
+      NODE_LASTLOG[$NODE]="Rebooting..."
+      dashboard
     done
 
     if ssh ${SSH_USER}@${NODE} "nvidia-smi" >/dev/null 2>&1; then
       NODE_STATUS[$NODE]="GPU_OK"
       NODE_GPU[$NODE]="YES"
+      NODE_LASTLOG[$NODE]="Driver verified"
     else
       NODE_STATUS[$NODE]="GPU_FAIL"
       NODE_GPU[$NODE]="NO"
+      NODE_LASTLOG[$NODE]="Verification failed"
     fi
 
     ((COMPLETED++))
@@ -241,6 +302,15 @@ install_nvidia_parallel() {
   }
 
   running=0
+
+  for NODE in $WORKERS; do
+    NODE_STATUS[$NODE]="QUEUED"
+    NODE_GPU[$NODE]="-"
+    NODE_LASTLOG[$NODE]="Waiting..."
+  done
+
+  dashboard
+
   for NODE in $WORKERS; do
     install_node "$NODE" &
     ((running++))
@@ -249,9 +319,9 @@ install_nvidia_parallel() {
       ((running--))
     fi
   done
+
   wait
 }
-
 ############################################
 # GPU Operator
 ############################################
