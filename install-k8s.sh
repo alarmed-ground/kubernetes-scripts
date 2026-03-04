@@ -235,6 +235,12 @@ containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
 sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 sudo systemctl restart containerd
 sudo systemctl enable containerd
+sudo modprobe overlay
+sudo modprobe br_netfilter
+echo -e "overlay\nbr_netfilter" | sudo tee /etc/modules-load.d/k8s.conf
+echo -e "net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1" \
+| sudo tee /etc/sysctl.d/k8s.conf
+sudo sysctl --system
 sudo apt install -y kubelet kubeadm
 sudo ${JOIN_CMD}
 EOF
