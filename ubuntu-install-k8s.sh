@@ -79,9 +79,11 @@ for NODE in "${!NODE_STATUS[@]}"; do
     *) COLOR=$RESET ;;
   esac
 
+  ROLE_DISPLAY="${NODE_ROLE[$NODE]:-unknown}"
+
   printf "%-15s ${COLOR}%-15s${RESET} %-8s %-8s %-20s %-35s\n" \
     "$NODE" \
-    "${NODE_ROLE[$NODE]}" \
+    "$ROLE_DISPLAY" \
     "$STATUS" \
     "$READY" \
     "$GPU" \
@@ -170,7 +172,7 @@ deploy_control_plane() {
     echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
     sudo apt update
     sudo apt install -y kubelet kubeadm kubectl
-    sudo kubeadm init --pod-network-cidr=${POD_CIDR}
+    sudo kubeadm init --pod-network-cidr=${POD_CIDR} --ignore-preflight-errors=all
     mkdir -p \$HOME/.kube
     sudo cp /etc/kubernetes/admin.conf \$HOME/.kube/config
     sudo chown \$(id -u):\$(id -g) \$HOME/.kube/config
@@ -515,7 +517,7 @@ single_node_poc() {
 
   NODE_STATUS[$LOCAL_NODE]="NODE_READY"
   NODE_READY[$LOCAL_NODE]="YES"
-  NODE_LASTLOG[$LOCAL_NODE]="Single-node cluster ready"
+  NODE_LASTLOG[$LOCAL_NODE]="Single-node PoC ready"
   COMPLETED=1
   dashboard
 }
