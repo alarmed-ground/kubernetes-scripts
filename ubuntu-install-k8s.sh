@@ -127,6 +127,8 @@ setup_passwordless_ssh() {
 # Prerequisites
 ############################################
 configure_prereqs() {
+  sudo apt update
+  sudo apt install -y curl apt-transport-https ca-certificates gnupg lsb-release software-properties-common nload ethtool ipmitool smartmontools
   sudo swapoff -a || true
   sudo sed -i '/ swap / s/^/#/' /etc/fstab || true
   sudo modprobe overlay
