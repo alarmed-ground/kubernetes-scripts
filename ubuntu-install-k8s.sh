@@ -53,7 +53,7 @@ echo -e "${CYAN}================================================================
 echo -e "${CYAN}                    KUBERNETES CLUSTER PROVISIONING DASHBOARD${RESET}"
 echo -e "${CYAN}===========================================================================================${RESET}"
 
-printf "%-15s %-13s %-15s %-8s %-8s %-20s %-35s\n" \
+printf "%-15s %-15s %-15s %-8s %-8s %-20s %-35s\n" \
 "NODE" "ROLE" "STATUS" "READY" "GPU" "GPU MODEL" "LAST LOG"
 echo "-------------------------------------------------------------------------------------------"
 
@@ -81,7 +81,7 @@ for NODE in "${!NODE_STATUS[@]}"; do
 
   ROLE_DISPLAY="${NODE_ROLE[$NODE]:-unknown}"
 
-  printf "%-15s ${COLOR}%-15s${RESET} %-8s %-8s %-20s %-35s\n" \
+  printf "%-15s ${COLOR}%-15s${RESET} %-15s %-8s %-8s %-20s %-35s\n" \
     "$NODE" \
     "$ROLE_DISPLAY" \
     "$STATUS" \
@@ -189,44 +189,59 @@ deploy_control_plane() {
 }
 
 ############################################
-# Worker Node Join
+# Worker Node Join (Parallel)
 ############################################
-join_workers() {
+join_workers_parallel() {
   WORKERS=$(get_node_list "Enter worker IPs")
   read -rp "SSH username for workers: " SSH_USER
+  read -rp "Max parallel joins [5]: " MAX
+  MAX=${MAX:-5}
 
-  for NODE in $WORKERS; do
-    ((TOTAL_NODES++))
+  TOTAL_NODES=$((TOTAL_NODES + $(echo $WORKERS | wc -w)))
+
+  join_node() {
+    NODE=$1
     NODE_ROLE[$NODE]="worker"
     NODE_STATUS[$NODE]="JOINING"
     NODE_READY[$NODE]="-"
     NODE_LASTLOG[$NODE]="Joining cluster..."
     dashboard
 
-    ssh "$SSH_USER@$NODE" "sudo $(cat ./logs/kube_join.sh)"
+    ssh "$SSH_USER@$NODE" "bash ./logs/kube_join.sh"
 
     NODE_STATUS[$NODE]="NODE_READY"
     NODE_READY[$NODE]="YES"
     NODE_LASTLOG[$NODE]="Node joined cluster"
     ((COMPLETED++))
     dashboard
+  }
+
+  running=0
+  for NODE in $WORKERS; do
+    join_node "$NODE" &
+    ((running++))
+    if [[ $running -ge $MAX ]]; then
+      wait -n
+      ((running--))
+    fi
   done
+  wait
 }
 
 ############################################
-# Parallel NVIDIA Install
+# NVIDIA Driver Install (Parallel)
 ############################################
 install_nvidia_parallel() {
-  WORKERS=$(get_node_list "Enter worker IPs (can be unjoined nodes)")
+  NODES=$(get_node_list "Enter node IPs for NVIDIA install (joined or not)")
   read -rp "SSH username: " SSH_USER
   read -rp "Max parallel installs [5]: " MAX
   MAX=${MAX:-5}
 
   mkdir -p ./logs/nvidia
   COMPLETED=0
+  TOTAL_NODES=$(echo "$NODES" | wc -w)
 
-  # Initialize node info if not set
-  for NODE in $WORKERS; do
+  for NODE in $NODES; do
     [[ -z "${NODE_ROLE[$NODE]+x}" ]] && NODE_ROLE[$NODE]="unknown"
     NODE_STATUS[$NODE]="GPU_INSTALL"
     NODE_GPU[$NODE]="-"
@@ -289,7 +304,7 @@ EOF
   }
 
   running=0
-  for NODE in $WORKERS; do
+  for NODE in $NODES; do
     install_node "$NODE" &
     ((running++))
     if [[ $running -ge $MAX ]]; then
@@ -449,44 +464,6 @@ EOF
 }
 
 ############################################
-# Uninstall Cluster
-############################################
-uninstall_cluster() {
-  read -rp "SSH username for all nodes: " SSH_USER
-  ALL_NODES=$(get_node_list "Enter all node IPs (control-plane + workers)")
-
-  echo -e "${RED}WARNING: Will remove Kubernetes, NVIDIA, Prometheus/Grafana, DCGM on all nodes!${RESET}"
-  read -rp "Continue? (y/n): " CONFIRM
-  [[ "${CONFIRM,,}" != "y" ]] && return
-
-  for NODE in $ALL_NODES; do
-    NODE_STATUS[$NODE]="REMOVING"
-    NODE_LASTLOG[$NODE]="Uninstalling..."
-    dashboard
-
-    ssh "$SSH_USER@$NODE" bash -c "'
-      set -e
-      sudo systemctl stop kubelet containerd || true
-      sudo kubeadm reset -f || true
-      sudo apt-get purge -y kubelet kubeadm kubectl || true
-      sudo apt-get purge -y nvidia-* || true
-      sudo apt-get autoremove -y
-      sudo rm -rf ~/.kube /etc/kubernetes /var/lib/etcd /var/lib/kubelet /mnt/prometheus /mnt/grafana
-      kubectl delete daemonset dcgm-exporter -n gpu-metrics --ignore-not-found
-      kubectl delete namespace gpu-metrics --ignore-not-found
-    '"
-
-    NODE_STATUS[$NODE]="REMOVED"
-    NODE_READY[$NODE]="NO"
-    NODE_GPU[$NODE]="-"
-    NODE_GPUMODEL[$NODE]="-"
-    NODE_LASTLOG[$NODE]="Removed"
-    dashboard
-  done
-  echo -e "${GREEN}Cluster uninstalled on all nodes.${RESET}"
-}
-
-############################################
 # Single-Node PoC Deployment
 ############################################
 single_node_poc() {
@@ -523,14 +500,79 @@ single_node_poc() {
 }
 
 ############################################
+# Untaint Control Plane
+############################################
+untaint_control_plane() {
+  CP_NODES=$(for node in "${!NODE_ROLE[@]}"; do
+    [[ "${NODE_ROLE[$node]}" == *control-plane* ]] && echo "$node"
+  done)
+
+  [[ -z "$CP_NODES" ]] && { echo "No control plane nodes found."; return; }
+
+  read -rp "SSH username for control plane nodes: " SSH_USER
+
+  for NODE in $CP_NODES; do
+    echo "Removing NoSchedule taint on $NODE..."
+    ssh "$SSH_USER@$NODE" "kubectl taint nodes $NODE node-role.kubernetes.io/control-plane- || true"
+    NODE_LASTLOG[$NODE]="Control plane untainted"
+    NODE_STATUS[$NODE]="CP_READY"
+  done
+
+  dashboard
+  echo -e "${GREEN}Control plane nodes are now schedulable.${RESET}"
+}
+
+############################################
+# Uninstall Cluster
+############################################
+uninstall_cluster() {
+  ALL_NODES=$(for node in "${!NODE_ROLE[@]}"; do echo "$node"; done)
+  [[ -z "$ALL_NODES" ]] && { echo "No nodes found."; return; }
+
+  read -rp "SSH username for all nodes: " SSH_USER
+
+  remove_node() {
+    NODE=$1
+    NODE_STATUS[$NODE]="REMOVING"
+    NODE_LASTLOG[$NODE]="Uninstalling..."
+    dashboard
+
+    ssh "$SSH_USER@$NODE" "
+      sudo kubeadm reset -f
+      sudo systemctl stop kubelet containerd
+      sudo apt purge -y kubeadm kubectl kubelet
+      sudo rm -rf ~/.kube /etc/cni/net.d /var/lib/kubelet /var/lib/etcd
+      sudo apt purge -y nvidia-*
+      sudo reboot
+    "
+    NODE_STATUS[$NODE]="REMOVED"
+    NODE_READY[$NODE]="NO"
+    NODE_LASTLOG[$NODE]="Uninstalled & rebooted"
+    ((COMPLETED++))
+    dashboard
+  }
+
+  running=0
+  for NODE in $ALL_NODES; do
+    remove_node "$NODE" &
+    ((running++))
+    if [[ $running -ge 5 ]]; then
+      wait -n
+      ((running--))
+    fi
+  done
+  wait
+}
+
+############################################
 # Main Menu
 ############################################
 while true; do
   echo ""
   echo "1) Setup Passwordless SSH + sudo"
   echo "2) Deploy Control Plane"
-  echo "3) Join Worker Nodes"
-  echo "4) Parallel NVIDIA Install + GPU Dashboard"
+  echo "3) Join Worker Nodes (parallel)"
+  echo "4) NVIDIA Driver Install (parallel)"
   echo "5) Setup NFS for Prometheus/Grafana"
   echo "6) Deploy Prometheus with PVC"
   echo "7) Deploy Grafana with PVC and dashboards"
@@ -539,13 +581,14 @@ while true; do
   echo "10) Single-Node PoC Deployment"
   echo "11) Uninstall entire cluster"
   echo "12) Exit"
+  echo "13) Untaint Control Plane Nodes"
   echo ""
 
   read -rp "Select: " opt
   case $opt in
     1) setup_passwordless_ssh ;;
     2) deploy_control_plane ;;
-    3) join_workers ;;
+    3) join_workers_parallel ;;
     4) install_nvidia_parallel ;;
     5) setup_nfs ;;
     6) deploy_prometheus ;;
@@ -555,6 +598,7 @@ while true; do
     10) single_node_poc ;;
     11) uninstall_cluster ;;
     12) exit 0 ;;
+    13) untaint_control_plane ;;
     *) echo "Invalid option" ;;
   esac
 done
