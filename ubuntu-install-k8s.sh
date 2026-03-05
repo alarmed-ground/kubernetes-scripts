@@ -215,14 +215,17 @@ join_workers() {
 # Parallel NVIDIA Install
 ############################################
 install_nvidia_parallel() {
-  WORKERS=$(get_node_list "Enter worker IPs")
+  WORKERS=$(get_node_list "Enter worker IPs (can be unjoined nodes)")
   read -rp "SSH username: " SSH_USER
   read -rp "Max parallel installs [5]: " MAX
   MAX=${MAX:-5}
 
   mkdir -p ./logs/nvidia
   COMPLETED=0
+
+  # Initialize node info if not set
   for NODE in $WORKERS; do
+    [[ -z "${NODE_ROLE[$NODE]+x}" ]] && NODE_ROLE[$NODE]="unknown"
     NODE_STATUS[$NODE]="GPU_INSTALL"
     NODE_GPU[$NODE]="-"
     NODE_GPUMODEL[$NODE]="-"
