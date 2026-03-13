@@ -1,6 +1,6 @@
 # Kubernetes Cluster Installer — Ubuntu 24.04
 
-Automated, wizard-driven installer for a production-ready Kubernetes cluster on Ubuntu 24.04. Covers everything from SSH key distribution to GPU-accelerated LLM inference, with a fully interactive uninstaller.
+Automated, wizard-driven installer for a production-ready Kubernetes cluster on Ubuntu 24.04. Covers everything from SSH key distribution to GPU-accelerated LLM inference with a fully interactive uninstaller.
 
 ---
 
@@ -27,7 +27,7 @@ Automated, wizard-driven installer for a production-ready Kubernetes cluster on 
 |---|---|
 | **Interactive wizard** | 10-section guided setup with real-time validation and a full summary review before saving |
 | **SSH key management** | Auto-generates a 4096-bit RSA key, distributes it to all nodes, verifies passwordless access |
-| **Node preparation** | Swap disabled, sysctl tuning, kernel modules, containerd with SystemdCgroup |
+| **Node preparation** | Swap disabled, sysctl tuning, kernel modules, containerd with SystemdCgroup, systemd-resolved stub DNS fix |
 | **NVIDIA driver install** | Per-branch selection, open or proprietary kernel modules, Fabric Manager, automatic reboot-and-wait |
 | **Kubernetes binaries** | Official `pkgs.k8s.io` repository, version-pinned, held against unintended upgrades |
 | **CNI plugin** | Flannel or Calico, fully configurable pod CIDR |
@@ -35,10 +35,10 @@ Automated, wizard-driven installer for a production-ready Kubernetes cluster on 
 | **NFS provisioner** | Dynamic PVC provisioning, optional NFS server setup, default StorageClass |
 | **Monitoring stack** | kube-prometheus-stack — Prometheus, Grafana, and Alertmanager with persistent storage |
 | **Kubernetes Dashboard** | Official v2.7.0, NodePort HTTPS access, long-lived admin token |
-| **vLLM production stack** | GPU-accelerated LLM inference with configurable model, HuggingFace token, engine params, and persistent model cache |
+| **vLLM production stack** | GPU-accelerated LLM inference — images pre-pulled via `ctr` before Helm deploy, correct `lmcache/*` images, `IfNotPresent` pull policy, generous startup probe timing, OpenAI-compatible router |
 | **Apt reliability** | Clock sync before update, `Check-Valid-Until=false` flag, exponential-backoff retry on failure |
 | **Interactive uninstaller** | 8-stage teardown — Helm releases, namespaces, kubeadm reset, packages, containerd, NVIDIA, NFS, local cleanup |
-| **Single-step re-run** | `--step <name>` reruns any individual installation phase |
+| **Single-step re-run** | `--step <n>` reruns any individual phase; accepts full section names as well as short keys |
 
 ---
 
@@ -78,13 +78,13 @@ sudo bash k8s_cluster_setup.sh
 bash k8s_smoke_test.sh
 ```
 
-The wizard saves all settings to `k8s_cluster.conf`. The installer sources this file automatically at startup, so no additional arguments are needed.
+The wizard saves all settings to `k8s_cluster.conf`. The installer sources this file automatically at startup.
 
 ---
 
 ## Configuration Wizard
 
-`k8s_configure.sh` is an interactive terminal wizard. It validates every input in real time, shows a full summary of all settings before saving, and offers to launch the installer immediately on completion. It does not require root.
+`k8s_configure.sh` is an interactive terminal wizard. It validates every input in real time, shows a full summary of all settings before saving, and offers to launch the installer immediately on completion. Root is not required.
 
 ### Wizard Sections
 
@@ -101,11 +101,13 @@ The wizard saves all settings to `k8s_cluster.conf`. The installer sources this 
 | 9 | Namespaces | GPU Operator namespace |
 | 10 | Summary & Confirm | Full review of all settings — press `n` to go back and re-run the wizard |
 
+On completion the wizard prints the exact `--step` commands for every phase so you can re-run any individual step later.
+
 ---
 
 ## Configuration Reference
 
-The wizard writes all settings to `k8s_cluster.conf`. You can also edit this file directly before running the installer. Variables that are not present in the file fall back to the defaults listed below.
+The wizard writes all settings to `k8s_cluster.conf`. You can also edit this file directly before running the installer. Variables not present in the file fall back to the defaults listed below.
 
 ### SSH
 
@@ -140,7 +142,7 @@ The wizard writes all settings to `k8s_cluster.conf`. You can also edit this fil
 | `NVIDIA_FABRIC_MANAGER` | `auto` | Fabric Manager for NVSwitch/NVLink: `auto` (detect at install time), `true` (always install), `false` (never install) |
 | `NVIDIA_REBOOT_TIMEOUT` | `300` | Seconds to wait per node for SSH to come back after the driver reboot — increase to 600 for slow hardware |
 
-> **Fabric Manager** is required on multi-GPU SXM platforms such as A100 SXM4, H100 SXM5, H200, DGX, and HGX systems. It is not needed for single PCIe GPU nodes. `auto` checks for NVSwitch presence at install time.
+> **Fabric Manager** is required on multi-GPU SXM platforms such as A100 SXM4, H100 SXM5, H200, DGX, and HGX systems. Not needed for single PCIe GPU nodes. `auto` checks for NVSwitch presence at install time.
 
 ### Monitoring (kube-prometheus-stack)
 
@@ -167,7 +169,7 @@ The wizard writes all settings to `k8s_cluster.conf`. You can also edit this fil
 | `NFS_STORAGE_CLASS` | `nfs-client` | Name of the StorageClass created by the provisioner |
 | `NFS_DEFAULT_SC` | `true` | Annotate this StorageClass as the cluster-wide default |
 
-> If `NFS_SERVER_IP` resolves to one of the cluster nodes, the installer will configure `nfs-kernel-server` and `/etc/exports` on that node automatically. If it is an external host, the export must already exist and be reachable before the installer runs.
+> If `NFS_SERVER_IP` resolves to one of the cluster nodes, the installer configures `nfs-kernel-server` and `/etc/exports` on that node automatically. If it is an external host, the export must already exist and be reachable before the installer runs.
 
 ### Kubernetes Dashboard
 
@@ -178,8 +180,7 @@ The wizard writes all settings to `k8s_cluster.conf`. You can also edit this fil
 | `DASHBOARD_NODEPORT` | `32443` | NodePort for Dashboard HTTPS |
 | `NS_DASHBOARD` | `kubernetes-dashboard` | Namespace for the Dashboard deployment |
 
-> After deployment the admin token is printed to the terminal and saved to `/root/dashboard-token.txt` (mode 600).
-> To retrieve it later:
+> After deployment the admin token is printed to the terminal and saved to `/root/dashboard-token.txt` (mode 600). To retrieve it later:
 > ```bash
 > kubectl get secret dashboard-admin-token \
 >   -n kubernetes-dashboard \
@@ -202,22 +203,14 @@ The wizard writes all settings to `k8s_cluster.conf`. You can also edit this fil
 | `VLLM_CPU_LIMIT` | `8` | CPU cores limit per replica pod |
 | `VLLM_MEM_REQUEST` | `16Gi` | Memory requested per replica pod |
 | `VLLM_MEM_LIMIT` | `32Gi` | Memory limit per replica pod |
-| `VLLM_EXTRA_ARGS` | *(blank)* | Additional vLLM engine flags passed verbatim, space-separated (e.g. `--enable-chunked-prefill --quantization awq`) |
+| `VLLM_EXTRA_ARGS` | *(blank)* | Additional vLLM engine flags, space-separated (e.g. `--enable-chunked-prefill --quantization awq`) |
 | `VLLM_STORAGE_SIZE` | `50Gi` | Size of the model cache PVC — ignored when `VLLM_REUSE_PVC=true` |
 | `VLLM_REUSE_PVC` | `false` | Set to `true` to mount an existing PVC instead of creating a new one |
 | `VLLM_PVC_NAME` | `vllm-model-cache` | Name of the PVC to create or reuse |
 
-> The HuggingFace token is stored as a Kubernetes Secret (`vllm-hf-token`) and injected into pods as the `HUGGING_FACE_HUB_TOKEN` environment variable. It is never written to log files.
+> The HuggingFace token is passed inline to the chart's `modelSpec[].hf_token` field and is never written to log files.
 >
-> The model cache PVC is mounted at `/root/.cache/huggingface`, so downloaded model weights survive pod restarts and rescheduling without re-downloading.
->
-> To add or update a token after deployment:
-> ```bash
-> kubectl create secret generic vllm-hf-token \
->   -n vllm --from-literal=token=<your-token> \
->   --dry-run=client -o yaml | kubectl apply -f -
-> kubectl rollout restart deployment -n vllm
-> ```
+> The model cache PVC is managed by the chart via `pvcStorage` and mounted at `/root/.cache/huggingface`, so downloaded weights survive pod restarts without re-downloading.
 
 ### GPU Operator
 
@@ -229,12 +222,12 @@ The wizard writes all settings to `k8s_cluster.conf`. You can also edit this fil
 
 ## Installation Steps
 
-The installer runs the following 14 steps in order. Each step is idempotent — it is safe to re-run on a partially or fully configured cluster.
+The installer runs the following 14 steps in order. Each step is idempotent — safe to re-run on a partially or fully configured cluster.
 
 | Step | `--step` name | What it does |
 |---|---|---|
 | 1 | `ssh` | Generates an SSH keypair if needed, distributes the public key to all nodes, verifies passwordless access |
-| 2 | `prep` | Disables swap, applies sysctl networking parameters, loads `overlay` and `br_netfilter` kernel modules, installs and configures containerd with `SystemdCgroup = true` |
+| 2 | `prep` | Disables swap, fixes `/etc/resolv.conf` systemd-resolved stub, applies sysctl networking parameters, loads kernel modules, installs and configures containerd with `SystemdCgroup = true` |
 | 3 | `nvidia` | Detects GPUs via `lspci`, installs the driver (Phase 1), reboots the node, waits for SSH to return, completes driver setup and container toolkit configuration (Phase 2) |
 | 4 | `k8s-bins` | Adds the official Kubernetes apt repository, installs and holds `kubeadm`, `kubelet`, and `kubectl` at the configured version |
 | 5 | `init` | Runs `kubeadm init` on the control plane, writes kubeconfig to `/root/.kube/config`, generates the worker join command |
@@ -243,33 +236,63 @@ The installer runs the following 14 steps in order. Each step is idempotent — 
 | 8 | `helm` | Downloads and installs the Helm binary on the control plane |
 | 9 | `nfs` | Configures the NFS server if it is a cluster node, verifies export reachability, deploys `nfs-subdir-external-provisioner` |
 | 10 | `monitoring` | Resolves the StorageClass, pre-creates the Prometheus PVC, deploys `kube-prometheus-stack` |
-| 11 | `gpu-op` | Deploys the NVIDIA GPU Operator, labels GPU nodes using their Kubernetes-registered InternalIP, verifies the DCGM exporter |
+| 11 | `gpu-op` | Deploys the NVIDIA GPU Operator, labels GPU nodes, verifies the DCGM exporter |
 | 12 | `dashboard` | Deploys the Kubernetes Dashboard, creates the admin ServiceAccount with `ClusterRoleBinding`, creates and retrieves the long-lived token Secret |
-| 13 | `vllm` | Creates the HuggingFace token Secret, creates or reuses the model cache PVC, deploys the vLLM production stack via Helm |
+| 13 | `vllm` | Pre-pulls `lmcache/vllm-openai` and `lmcache/lmstack-router` on all nodes via `ctr`, deploys the vLLM production stack via Helm with `IfNotPresent` pull policy and generous startup probe timing |
 | 14 | `verify` | Prints all node status, all pods across namespaces, StorageClasses, and NodePort/LoadBalancer services |
 
 ### Apt Cache Reliability
 
 Before every `apt-get update` on every node the installer:
 
-1. Syncs the system clock with `chronyc makestep`. If chrony is not installed it tries `ntpdate`, and if neither is available it installs chrony first. This eliminates the `"Release file is not valid yet (invalid for another Xh Ymin)"` error caused by a node clock lagging behind the mirror's release timestamp.
-2. Passes `-o Acquire::Check-Valid-Until=false` to tolerate any residual small clock skew.
+1. Syncs the system clock with `chronyc makestep`. If chrony is not installed it tries `ntpdate`, and if neither is available it installs chrony first.
+2. Passes `-o Acquire::Check-Valid-Until=false` to tolerate residual small clock skew.
 3. Retries up to three times with exponential back-off: 15 s, 30 s, 60 s.
-4. Never aborts the installation on an apt cache failure — logs a clear warning and continues.
+4. Never aborts the installation on an apt cache failure — logs a warning and continues.
+
+### systemd-resolved DNS Fix (Step 2)
+
+Ubuntu 24.04 symlinks `/etc/resolv.conf` to the systemd-resolved stub at `127.0.0.53`. That address is only reachable on the node's loopback interface — pods in their own network namespace cannot reach it, causing `Temporary failure in name resolution` inside containers (e.g. vLLM downloading model weights from huggingface.co).
+
+During node preparation the installer re-links `/etc/resolv.conf` to `/run/systemd/resolve/resolv.conf`, which contains real upstream nameserver IPs. Three fallback levels are applied:
+
+1. Symlink to `/run/systemd/resolve/resolv.conf`
+2. Extract real nameservers from `resolvectl status` and write a static file
+3. Fall back to `8.8.8.8` / `8.8.4.4` as a last resort with a visible warning
+
+**To fix an existing cluster manually** (run on every node as root, then delete the affected pods):
+
+```bash
+sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+cat /etc/resolv.conf          # confirm no 127.0.0.53
+sudo systemctl restart kubelet
+kubectl delete pods -n vllm -l app=vllm-stack
+```
 
 ### NVIDIA Driver Reboot Sequence
 
 Driver installation is split into two phases separated by a controlled node reboot:
 
 - **Phase 1**: Install driver and DKMS packages, blacklist nouveau, install the container toolkit, write the containerd runtime config.
-- **Reboot**: The installer sends the reboot command and then polls SSH every 10 seconds until the node responds, up to `NVIDIA_REBOOT_TIMEOUT` seconds.
+- **Reboot**: The installer sends the reboot command and polls SSH every 10 seconds until the node responds, up to `NVIDIA_REBOOT_TIMEOUT` seconds.
 - **Phase 2**: Wait for DKMS to finish compiling the kernel module, load `nvidia` with `modprobe`, run `nvidia-smi` to verify, enable Fabric Manager if required, restart containerd.
+
+### vLLM Image Pre-pull (Step 13)
+
+Before Helm deploys any pods the installer pulls both vLLM images directly on every node using `ctr` (the containerd CLI):
+
+```
+docker.io/lmcache/vllm-openai:latest    (~10 GB)
+docker.io/lmcache/lmstack-router:latest (~2 GB)
+```
+
+This prevents the `context canceled` pull failure that occurs when containerd's download is interrupted by a pod being rescheduled or a startup probe firing before the pull completes. The chart is deployed with `imagePullPolicy: IfNotPresent` so Kubernetes never re-pulls an already-cached image.
 
 ---
 
 ## Access Endpoints
 
-All services are exposed via NodePort and are accessible at the control plane IP.
+All services are exposed via NodePort and accessible at the control plane IP.
 
 | Service | URL | Default Port | Credentials |
 |---|---|---|---|
@@ -300,7 +323,7 @@ curl http://<CONTROL_PLANE_IP>:32080/v1/chat/completions \
 helm upgrade vllm-stack vllm/vllm-stack \
   -n vllm \
   --reuse-values \
-  --set servingEngineSpec.model=<huggingface-model-id>
+  --set 'servingEngineSpec.modelSpec[0].modelURL=<huggingface-model-id>'
 ```
 
 ---
@@ -313,32 +336,49 @@ Any step can be re-run on its own without affecting other components:
 sudo bash k8s_cluster_setup.sh --step <step-name>
 ```
 
-This is useful for re-applying a failed step, reinstalling a single component after changing its config, or adding an optional component (Dashboard, vLLM) to an existing cluster. Simply set the relevant `INSTALL_*` variable to `true` in `k8s_cluster.conf` and run the corresponding step.
+### Available Step Names
+
+| Short name | Aliases accepted | Phase |
+|---|---|---|
+| `ssh` | — | SSH key setup |
+| `prep` | `node-prep`, `Node Preparation` | Node preparation |
+| `nvidia` | `nvidia drivers`, `NVIDIA Drivers` | NVIDIA driver install |
+| `k8s-bins` | `k8s bins`, `Kubernetes Binaries` | Kubernetes binaries |
+| `init` | `control plane`, `Control Plane Init` | Control plane init |
+| `cni` | `CNI`, `CNI Plugin` | CNI plugin |
+| `workers` | `join workers`, `Join Workers` | Join worker nodes |
+| `helm` | `Helm`, `Install Helm` | Install Helm |
+| `nfs` | `NFS`, `NFS Provisioner` | NFS provisioner |
+| `monitoring` | `prometheus`, `grafana`, `Prometheus + Grafana` | Monitoring stack |
+| `gpu-op` | `gpu operator`, `GPU Operator`, `gpu-operator` | GPU Operator |
+| `dashboard` | `Dashboard`, `Kubernetes Dashboard` | Kubernetes Dashboard |
+| `vllm` | `vLLM`, `vLLM Stack`, `vLLM Production Stack` | vLLM stack |
+| `verify` | `Verify`, `verification` | Post-install check |
+
+This is useful for re-applying a failed step, reinstalling a single component after changing its config, or adding an optional component (Dashboard, vLLM) to an existing cluster. Set the relevant `INSTALL_*` variable to `true` in `k8s_cluster.conf` and run the corresponding step.
 
 ---
 
 ## Uninstalling
 
-The installer includes a fully interactive uninstaller.
-
 ```bash
 sudo bash k8s_cluster_setup.sh --uninstall
 ```
 
-You will be asked to confirm twice: first with a yes/no prompt, then by typing **`DESTROY`** exactly. After that, each of the eight stages below presents its own yes/no prompt so you can skip individual stages if needed.
+You will be asked to confirm twice: first with a yes/no prompt, then by typing **`DESTROY`** exactly. Each of the eight stages then presents its own yes/no prompt so you can skip individual stages.
 
 | Stage | What it removes | Default |
 |---|---|---|
-| 1 | **Helm releases** — all releases in all namespaces, uninstalled with `--wait` | yes |
-| 2 | **Namespaces** — monitoring, NFS, GPU Operator, Dashboard, and vLLM namespaces and all their contained resources | yes |
-| 3 | **kubeadm reset** — `kubeadm reset --force` on every node, iptables and ipvs flushed, CNI directories removed, Kubernetes state directories removed, kubelet stopped and disabled | yes |
-| 4 | **Kubernetes packages** — `kubeadm`, `kubelet`, `kubectl` purged on every node, apt source and keyring removed, `~/.kube` and Helm binary deleted | yes |
+| 1 | **Helm releases** — all releases in all namespaces | yes |
+| 2 | **Namespaces** — monitoring, NFS, GPU Operator, Dashboard, and vLLM namespaces | yes |
+| 3 | **kubeadm reset** — `kubeadm reset --force` on every node, iptables/ipvs flushed, CNI directories removed, kubelet stopped and disabled | yes |
+| 4 | **Kubernetes packages** — `kubeadm`, `kubelet`, `kubectl` purged, apt source and keyring removed, `~/.kube` and Helm binary deleted | yes |
 | 5 | **containerd** — stopped, purged, Docker apt source removed, `/var/lib/containerd` deleted | yes |
 | 6 | **NVIDIA components** *(only when `INSTALL_NVIDIA=true`)* — all `nvidia-*` packages and the container toolkit purged, nouveau blacklist removed, initramfs rebuilt | yes |
-| 7 | **NFS server** *(only when `INSTALL_NFS=true`)* — export entry removed from `/etc/exports`, `nfs-kernel-server` stopped and purged. A separate prompt offers to delete the data directory on the server. | **no** |
+| 7 | **NFS server** *(only when `INSTALL_NFS=true`)* — export entry removed, `nfs-kernel-server` stopped and purged. A separate prompt offers to delete the data directory. | **no** |
 | 8 | **Local cleanup** — `/root/.kube/config`, lock file, join command file, Dashboard token file | yes |
 
-> A reboot of all nodes is recommended after uninstalling to clear any remaining kernel state, including loaded modules and iptables rules written directly by the kernel.
+> A reboot of all nodes is recommended after uninstalling to clear any remaining kernel state.
 
 ---
 
@@ -361,14 +401,20 @@ You will be asked to confirm twice: first with a yes/no prompt, then by typing *
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | SSH key copy fails | Password authentication disabled on target | Add `PasswordAuthentication yes` to `/etc/ssh/sshd_config` and run `systemctl reload ssh` |
-| `"Release file is not valid yet"` | Node clock behind the apt mirror | The installer syncs the clock automatically — if it persists, run `chronyc makestep` on the affected node |
+| `"Release file is not valid yet"` | Node clock behind the apt mirror | The installer syncs the clock automatically — if it persists, run `chronyc makestep` manually |
 | kubeadm init fails | kubelet not running or misconfigured | `journalctl -xeu kubelet` on the control plane node |
 | Nodes stuck `NotReady` | CNI pods not running | `kubectl get pods -n kube-flannel` or `kubectl get pods -n calico-system` |
 | GPU node not labelled | NVIDIA driver not loaded | Run `nvidia-smi` on the node; reboot if the driver was just installed |
 | vLLM pods stuck `Pending` | No GPU-labelled nodes or insufficient GPU resources | `kubectl get nodes -l nvidia.com/gpu.present=true` and check GPU Operator health |
-| vLLM model download takes a long time | Large model weights over a slow connection | This is expected — monitor with `kubectl logs -n vllm -l app=vllm-stack -f` |
-| Gated model returns 401 | HuggingFace token missing or invalid | `kubectl create secret generic vllm-hf-token -n vllm --from-literal=token=<token> --dry-run=client -o yaml \| kubectl apply -f -` then restart the pods |
+| vLLM pod DNS failure (`Errno -3`) | `/etc/resolv.conf` points to systemd stub `127.0.0.53` — unreachable from pod network namespace | Run `sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf && sudo systemctl restart kubelet` on every node, then `kubectl delete pods -n vllm -l app=vllm-stack` |
+| vLLM image pull cancelled mid-stream | Large image (~10 GB) interrupted by pod reschedule or probe timeout | Images are pre-pulled via `ctr` before Helm deploys — re-run `--step vllm` to retry |
+| `ctr` image pull DNS error | `ctr` does not assume Docker Hub — needs full `docker.io/` prefix | The installer uses `docker.io/lmcache/...` explicitly |
+| `Unknown step: vLLM Production Stack` | Passing the section title instead of the step key | Use `--step vllm` — or any alias from the step names table above |
+| vLLM YAML parse error on deploy | Empty optional fields producing blank lines inside YAML sequence item | Fixed — values file is written line-by-line with conditional `echo` |
+| vLLM startup probe fails immediately | Router probing engine before model has loaded | Startup probe budget is sized per GPU count: 45 s delay + 120 × 10 s window = ~21 min total |
+| vLLM model download takes a long time | Large model weights over a slow connection | Expected on first deploy — monitor with `kubectl logs -n vllm -l app=vllm-stack -f` |
+| Gated model returns 401 | HuggingFace token missing or invalid | Set `VLLM_HF_TOKEN` in `k8s_cluster.conf` and re-run `--step vllm` |
 | NFS PVC stuck `Pending` | NFS server unreachable from the cluster | `showmount -e <NFS_SERVER_IP>` — check ports 2049/tcp and 111/tcp+udp are open |
 | Prometheus CrashLoopBackOff | Insufficient node memory | Nodes should have at least 4 GB RAM; inspect with `kubectl describe pod -n monitoring` |
-| Dashboard shows `unknown authority` | Self-signed TLS certificate | Accept the browser certificate exception, or retrieve the token and use `kubectl proxy` |
+| Dashboard shows `unknown authority` | Self-signed TLS certificate | Accept the browser certificate exception, or use `kubectl proxy` |
 | Uninstall leaves stale iptables rules | Kernel-level rules not cleared by userspace reset | Reboot the node, or run `iptables -F && iptables -X` manually |
