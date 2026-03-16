@@ -73,8 +73,16 @@ fi
 SSH_USER="${SSH_USER:-ubuntu}"                    # Remote user with sudo privileges
 SSH_KEY_PATH="${SSH_KEY_PATH:-${HOME}/.ssh/k8s_cluster_rsa}"
 K8S_VERSION="${K8S_VERSION:-1.31}"               # Kubernetes minor version
-POD_CIDR="${POD_CIDR:-10.244.0.0/16}"           # Flannel default; change for Calico: 192.168.0.0/16
 CNI_PLUGIN="${CNI_PLUGIN:-flannel}"              # flannel | calico
+# Auto-select the correct default pod CIDR for the chosen CNI plugin.
+# Flannel expects 10.244.0.0/16; Calico works with any CIDR but uses
+# 192.168.0.0/16 by convention.  An explicit POD_CIDR in k8s_cluster.conf
+# always takes precedence — this only fills in the default when unset.
+if [[ "${CNI_PLUGIN}" == "calico" ]]; then
+  POD_CIDR="${POD_CIDR:-192.168.0.0/16}"
+else
+  POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
+fi
 NFS_SERVER_IP="${NFS_SERVER_IP:-}"               # IP of your NFS server
 NFS_PATH="${NFS_PATH:-/srv/nfs/k8s}"            # Exported NFS path on server
 NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-590}"  # 525|535|550|560|565|570|580|590 or *-open variants
@@ -253,6 +261,8 @@ ssh_exec() {
       -o StrictHostKeyChecking=no \
       -o ConnectTimeout=15 \
       -o BatchMode=yes \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=60 \
       "${SSH_USER}@${host}" "$@"
 }
 
@@ -676,6 +686,40 @@ swapoff -a
 sed -i.bak '/[[:space:]]swap[[:space:]]/d' /etc/fstab
 echo "[node-prep] Swap disabled."
 
+# ── 2b. Fix systemd-resolved stub DNS ────────────────────────────────────────
+# Ubuntu 24.04 defaults /etc/resolv.conf to the systemd-resolved stub at
+# 127.0.0.53.  That address is only reachable on the node's loopback interface
+# and is unreachable from inside pod network namespaces, causing DNS failures
+# like "Temporary failure in name resolution" inside containers (e.g. vLLM
+# trying to reach huggingface.co).
+# Fix: point /etc/resolv.conf at the real upstream resolv.conf that
+# systemd-resolved maintains, which contains actual nameserver IPs.
+step "Fixing /etc/resolv.conf for pod DNS (systemd-resolved stub workaround)"
+if grep -q '127.0.0.53' /etc/resolv.conf 2>/dev/null; then
+  ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+  echo "[node-prep] /etc/resolv.conf re-linked to /run/systemd/resolve/resolv.conf"
+  # Verify the result has a real nameserver
+  if grep -q '127.0.0.53' /etc/resolv.conf 2>/dev/null; then
+    echo "[node-prep] WARNING: /run/systemd/resolve/resolv.conf still shows stub — trying fallback"
+    # Fallback: extract real nameservers from resolvectl and write a static file
+    resolvectl status 2>/dev/null \
+      | awk '/DNS Servers/{for(i=3;i<=NF;i++) print "nameserver " $i}' \
+      | head -3 > /etc/resolv.conf.real
+    echo "search cluster.local" >> /etc/resolv.conf.real
+    if [[ -s /etc/resolv.conf.real ]]; then
+      cp /etc/resolv.conf.real /etc/resolv.conf
+      echo "[node-prep] Wrote static /etc/resolv.conf from resolvectl output."
+    else
+      # Last resort: use well-known public DNS
+      printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\nsearch cluster.local\n' \
+        > /etc/resolv.conf
+      echo "[node-prep] WARNING: fell back to 8.8.8.8 — set a proper nameserver later."
+    fi
+  fi
+else
+  echo "[node-prep] /etc/resolv.conf already has a real nameserver — no change needed."
+fi
+
 # ── 3. Kernel modules ─────────────────────────────────────────────────────────
 step "Loading required kernel modules"
 modprobe overlay
@@ -702,11 +746,51 @@ fs.inotify.max_user_instances       = 512
 vm.max_map_count                    = 262144
 # Connection tracking table size
 net.netfilter.nf_conntrack_max      = 1048576
+# Disable strict reverse-path filtering.
+# Ubuntu 24.04 defaults to rp_filter=2 (strict mode), which drops packets
+# whose return path differs from the incoming interface — exactly what happens
+# with Calico VXLAN and asymmetric pod routing.  Setting to 0 (off) is
+# required for Calico; setting to 1 (loose) is the minimum for Flannel.
+# Calico's own install docs require rp_filter=0 on all nodes.
+net.ipv4.conf.all.rp_filter     = 0
+net.ipv4.conf.default.rp_filter = 0
 EOF
 sysctl --system -q
 echo "[node-prep] Sysctl applied."
 
-# ── 5. containerd ─────────────────────────────────────────────────────────────
+# ── 4b. IP masquerade for pod CIDR ────────────────────────────────────────────
+# Without this, pods (including CoreDNS) send UDP/TCP with source IPs from the
+# pod CIDR (e.g. 10.244.0.0/16).  The upstream router does not know this range
+# and drops the packets — causing CoreDNS "i/o timeout" errors when forwarding
+# queries to the upstream nameserver, which manifests as DNS failures inside
+# every pod ("Temporary failure in name resolution").
+#
+# The MASQUERADE rule SNAT's outbound pod traffic to the node's own IP before
+# it leaves the NIC, so the router sees packets from a known host IP and replies
+# correctly.  Flannel normally adds this rule itself, but only after kubeadm
+# init — this ensures it is present before any pods start.
+step "Adding pod CIDR masquerade rule (pod → external SNAT)"
+# Derive the pod CIDR — use the configured value if available, else default
+_POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
+# Idempotent: only add if not already present
+if ! iptables -t nat -C POSTROUTING -s "${_POD_CIDR}" ! -d "${_POD_CIDR}" -j MASQUERADE 2>/dev/null; then
+  iptables -t nat -A POSTROUTING -s "${_POD_CIDR}" ! -d "${_POD_CIDR}" -j MASQUERADE
+  echo "[node-prep] Masquerade rule added for ${_POD_CIDR}."
+else
+  echo "[node-prep] Masquerade rule for ${_POD_CIDR} already present — skipping."
+fi
+
+# Persist the rule so it survives reboots
+if command -v netfilter-persistent &>/dev/null; then
+  netfilter-persistent save 2>/dev/null || true
+elif command -v iptables-save &>/dev/null; then
+  # Install iptables-persistent non-interactively if not present
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent 2>/dev/null || true
+  netfilter-persistent save 2>/dev/null || true
+fi
+echo "[node-prep] Masquerade rule persisted."
+
+
 step "Installing containerd"
 
 # Add Docker's official GPG key
@@ -1228,22 +1312,41 @@ install_nvidia_drivers() {
 # ──────────────────────────────────────────────────────────────────────────────
 generate_k8s_binaries_script() {
   local k8s_ver="$1"
-  cat <<K8SBINEOF
+  # Quoted heredoc (<<'K8SBINEOF') — no variable expansion by the outer shell.
+  # K8S_VER_PLACEHOLDER is replaced by sed below so the generated script gets
+  # the correct version baked in as a literal string (no variables needed).
+  sed "s|K8S_VER_PLACEHOLDER|${k8s_ver}|g" <<'K8SBINEOF'
 #!/usr/bin/env bash
 set -euo pipefail
-echo "[k8s-bin] Adding Kubernetes apt repository (v${k8s_ver})..."
+echo "[k8s-bin] Adding Kubernetes apt repository (vK8S_VER_PLACEHOLDER)..."
 install -m 0755 -d /etc/apt/keyrings
-curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${k8s_ver}/deb/Release.key" \
+curl -fsSL "https://pkgs.k8s.io/core:/stable:/vK8S_VER_PLACEHOLDER/deb/Release.key" \
   | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
 echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
-  https://pkgs.k8s.io/core:/stable:/v${k8s_ver}/deb/ /" \
+  https://pkgs.k8s.io/core:/stable:/vK8S_VER_PLACEHOLDER/deb/ /" \
   > /etc/apt/sources.list.d/kubernetes.list
 
 apt-get update -qq
-apt-get install -y -qq kubelet kubeadm kubectl
+apt-get install -y -qq kubelet kubeadm kubectl kubernetes-cni
 apt-mark hold kubelet kubeadm kubectl
+
+# Ensure CNI plugin binaries exist in /opt/cni/bin.
+# kubernetes-cni normally installs them, but after a kubeadm reset the
+# directory can be absent even if the package is already marked installed.
+# The loopback plugin is required for every pod sandbox — without it every
+# pod fails with "failed to find plugin loopback in path [/opt/cni/bin]".
+if [[ ! -f /opt/cni/bin/loopback ]]; then
+  echo "[k8s-bin] /opt/cni/bin/loopback missing — installing CNI plugins from upstream..."
+  CNI_VER=v1.4.0
+  mkdir -p /opt/cni/bin
+  curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_VER}/cni-plugins-linux-amd64-${CNI_VER}.tgz" \
+    | tar -xz -C /opt/cni/bin
+  echo "[k8s-bin] CNI plugins installed: $(ls /opt/cni/bin | tr '\n' ' ')"
+else
+  echo "[k8s-bin] CNI plugins already present at /opt/cni/bin."
+fi
 
 systemctl enable --now kubelet
 echo "[k8s-bin] Kubernetes binaries installed and held."
@@ -1365,13 +1468,60 @@ install_cni() {
   if [[ "$CNI_PLUGIN" == "flannel" ]]; then
     kubectl apply -f \
       https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
   elif [[ "$CNI_PLUGIN" == "calico" ]]; then
+    # Apply the Calico manifest
     kubectl apply -f \
       https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
+
+    # ── Switch Calico from IPIP to VXLAN ──────────────────────────────────────
+    # Calico defaults to IPIP (IP protocol 4) for cross-node pod traffic.
+    # IPIP is frequently dropped by hypervisors and cloud firewalls because it
+    # uses raw IP encapsulation rather than a standard UDP/TCP port.
+    # VXLAN (UDP 4789) works universally — through VMs, Proxmox, cloud NAT, etc.
+    # We patch both the IPPool and FelixConfiguration immediately after apply
+    # before any pods start routing traffic through the tunnel.
+
+    # Wait for Calico CRDs to be established before patching
+    info "Waiting for Calico CRDs to be ready..."
+    local crd_wait=0
+    until kubectl get ippool default-ipv4-ippool &>/dev/null 2>&1; do
+      sleep 5; crd_wait=$(( crd_wait + 5 ))
+      (( crd_wait > 120 )) && { error "Calico IPPool CRD not ready after 120s"; exit 1; }
+    done
+    log "Calico CRDs ready after ${crd_wait}s."
+
+    info "Switching Calico tunnel mode from IPIP to VXLAN..."
+    kubectl patch felixconfiguration default \
+      --type=merge \
+      --patch '{"spec":{"ipipEnabled":false,"vxlanEnabled":true}}' \
+      2>/dev/null || \
+    kubectl create -f - <<EOF
+apiVersion: projectcalico.org/v3
+kind: FelixConfiguration
+metadata:
+  name: default
+spec:
+  ipipEnabled: false
+  vxlanEnabled: true
+EOF
+
+    kubectl patch ippool default-ipv4-ippool \
+      --type=merge \
+      --patch '{"spec":{"ipipMode":"Never","vxlanMode":"Always"}}' || \
+      warn "IPPool patch failed — Calico may still be initialising; VXLAN may need manual enable."
+
+    # Restart calico-node pods to pick up the tunnel mode change
+    kubectl rollout restart daemonset/calico-node -n calico-system 2>/dev/null || \
+    kubectl rollout restart daemonset/calico-node -n kube-system  2>/dev/null || true
+
+    log "Calico configured in VXLAN mode."
+
   else
     error "Unknown CNI plugin: ${CNI_PLUGIN}. Choose flannel or calico."
     exit 1
   fi
+
   log "CNI plugin ${CNI_PLUGIN} applied."
 }
 
@@ -1943,17 +2093,54 @@ install_vllm() {
   info "  Router : ${router_image}"
   info "This may take 10-30 minutes on first deploy (images are ~10 GB + ~2 GB)."
 
+  # Write a self-contained pull script and ship it to each node via scp_and_run.
+  # We cannot use run_on here because:
+  #   1. ssh_exec has no ServerAliveInterval by default, so a silent 10 GB pull
+  #      over a long-lived SSH connection gets killed by the server's idle timeout.
+  #   2. sudo on remote nodes may have a restricted PATH; we use the full path to ctr.
+  #   3. ctr output is buffered — the script echoes progress so the connection
+  #      stays alive and the installer log shows what is happening.
+  local pull_script="/tmp/vllm_prepull_$$.sh"
+  cat > "$pull_script" <<PULLEOF
+#!/usr/bin/env bash
+set -euo pipefail
+CTR=/usr/bin/ctr
+NS=k8s.io
+VLLM_IMG="${vllm_image}"
+ROUTER_IMG="${router_image}"
+
+echo "[prepull] Checking \${VLLM_IMG} ..."
+if \${CTR} --namespace \${NS} images check name==\${VLLM_IMG} 2>/dev/null | grep -q \${VLLM_IMG}; then
+  echo "[prepull] \${VLLM_IMG} already cached — skipping pull."
+else
+  echo "[prepull] Pulling \${VLLM_IMG} (this may take 10-30 min)..."
+  \${CTR} --namespace \${NS} images pull \${VLLM_IMG}
+  echo "[prepull] \${VLLM_IMG} pulled OK."
+fi
+
+echo "[prepull] Checking \${ROUTER_IMG} ..."
+if \${CTR} --namespace \${NS} images check name==\${ROUTER_IMG} 2>/dev/null | grep -q \${ROUTER_IMG}; then
+  echo "[prepull] \${ROUTER_IMG} already cached — skipping pull."
+else
+  echo "[prepull] Pulling \${ROUTER_IMG} ..."
+  \${CTR} --namespace \${NS} images pull \${ROUTER_IMG}
+  echo "[prepull] \${ROUTER_IMG} pulled OK."
+fi
+PULLEOF
+  chmod 700 "$pull_script"
+
   local pull_failed=false
   for node in "${unique_nodes[@]}"; do
-    info "  Pulling on ${node}..."
-    # ctr is the containerd CLI; it requires the k8s.io namespace
-    local pull_cmd="ctr --namespace k8s.io images pull ${vllm_image} && ctr --namespace k8s.io images pull ${router_image}"
-    run_on "$node" "$pull_cmd" || {
+    info "  Pulling on ${node} (large images — may take 10-30 min, please wait)..."
+    # Use run_script_on instead of scp_and_run directly so that when node is
+    # the local machine (control plane running this script) we execute the pull
+    # script directly without trying to SSH to ourselves.
+    run_script_on "$node" "$pull_script" || {
       warn "Image pull on ${node} failed or timed out — Helm deploy may still work if image is cached."
       pull_failed=true
     }
-    log "Images pulled on ${node}."
   done
+  rm -f "$pull_script"
 
   if $pull_failed; then
     warn "One or more nodes had pull errors. Proceeding with Helm deploy anyway."
@@ -1999,26 +2186,68 @@ install_vllm() {
     extra_args_list="${extra_args_list%, }]"
   fi
 
-  # ── Probe timing — scaled by GPU count as a proxy for model size ──────────
-  # vLLM's HTTP server on :8000 only becomes available AFTER the model is
-  # fully loaded into GPU memory.  The startup probe must cover:
-  #   • image pull time     (first deploy only, skipped if image is cached)
-  #   • model download time (first deploy only, skipped if PVC is warm)
-  #   • model load time     (every start — depends on model size and disk speed)
+  # ── Probe timing — sized for worst-case first-run model download + load ────
   #
-  # Budget = initialDelaySeconds + (failureThreshold × periodSeconds)
-  # With failureThreshold=120 and periodSeconds=10 → 20 min window after delay.
+  # vLLM HTTP on :8000 only becomes available AFTER ALL of:
+  #   1. Container image pull   (first deploy only — ~2 GB, skipped if cached)
+  #   2. Model weight download  (first deploy only — 1–70 GB from HuggingFace)
+  #   3. Weight loading to VRAM (every start — depends on model size + disk speed)
+  #   4. KV cache allocation    (every start — fast)
+  #   5. Encoder cache profiling(multimodal only — 1-5 min)
+  #   6. CUDA graph capture     (every start — 1-5 min)
+  #
+  # If the startup probe exhausts its budget before step 6 completes, kubelet
+  # kills the container and causes an infinite restart loop.
+  #
+  # Strategy: initialDelaySeconds = expected warm-load time (probe does not
+  # fire at all during this window).  failureThreshold = safety net covering
+  # slow disks + first-run model download (~30 min buffer).
+  #
+  # Warm-load estimates by model class (no download, NVMe disk):
+  #   1-3B  → ~2-4  min  →  300s delay + 210x10s = ~40 min total budget
+  #   7-8B  → ~4-8  min  →  480s delay + 210x10s = ~43 min total budget
+  #   13-14B→ ~8-12 min  →  720s delay + 210x10s = ~47 min total budget
+  #   34B   → ~15-25 min → 1200s delay + 240x10s = ~60 min total budget
+  #   70B   → ~30-50 min → 2400s delay + 300x10s = ~90 min total budget
+  # First-run adds download time — the generous failureThreshold covers this.
+
   local gpu_count="${VLLM_GPU_COUNT:-1}"
-  local engine_init_delay=$(( 30 + gpu_count * 15 ))  # 45s for 1 GPU, 60s for 2, …
-  local engine_failure_thresh=120                      # 120 × 10s = 20 min window
+  local model_id="${VLLM_MODEL:-}"
   local engine_period=10
 
-  # Router probes check the router's own HTTP port (:8080), NOT the engine.
-  # The router starts quickly (it's just a Python proxy); its /health returns
-  # 200 even with zero backends registered.  A small startup budget is fine.
-  # The router's readiness probe is what controls whether it receives traffic.
-  local router_init_delay=10
-  local router_failure_thresh=30  # 30 × 10s = 5 min window
+  # Classify model size from the model ID string
+  local model_class="small"
+  if echo "$model_id" | grep -qiE "70b|65b|72b|mixtral.*8x7"; then
+    model_class="70b"
+  elif echo "$model_id" | grep -qiE "34b|33b|30b|40b"; then
+    model_class="34b"
+  elif echo "$model_id" | grep -qiE "13b|14b|15b|20b"; then
+    model_class="13b"
+  elif echo "$model_id" | grep -qiE "7b|8b|9b|mistral|qwen.*7|llama.*8"; then
+    model_class="7b"
+  fi
+
+  local engine_init_delay engine_failure_thresh
+  case "$model_class" in
+    70b)  engine_init_delay=2400; engine_failure_thresh=300 ;;
+    34b)  engine_init_delay=1200; engine_failure_thresh=240 ;;
+    13b)  engine_init_delay=720;  engine_failure_thresh=210 ;;
+    7b)   engine_init_delay=480;  engine_failure_thresh=210 ;;
+    *)    engine_init_delay=300;  engine_failure_thresh=210 ;;
+  esac
+
+  # Multi-GPU: NCCL init adds ~60s per extra GPU
+  if (( gpu_count > 1 )); then
+    engine_init_delay=$(( engine_init_delay + (gpu_count - 1) * 60 ))
+  fi
+
+  local engine_budget=$(( engine_init_delay + engine_failure_thresh * engine_period ))
+  info "Startup probe: ${engine_init_delay}s initial delay + ${engine_failure_thresh}x${engine_period}s = ${engine_budget}s (~$((engine_budget/60)) min) for model class '${model_class}'"
+
+  # Router: lightweight Python proxy, starts in <30s.
+  # /health returns 200 even with no backends — small budget is fine.
+  local router_init_delay=30
+  local router_failure_thresh=30   # 30 × 10s = 5 min window
   local router_period=10
 
   local values_file="/tmp/vllm-values-$$.yaml"
@@ -2120,9 +2349,6 @@ routerSpec:
     limits:
       cpu: "2"
       memory: "4Gi"
-
-  serviceType: "NodePort"
-  serviceNodePort: ${VLLM_NODEPORT}
 EOF
 
   # ── Deploy ─────────────────────────────────────────────────────────────────
@@ -2130,6 +2356,10 @@ EOF
   # --timeout, which is impossible during a first-time model download because
   # readiness only passes after the startup probe succeeds (which can take
   # 20+ minutes for large models).  We use our own poll loop instead.
+  #
+  # NOTE: The vllm-stack chart does NOT support serviceType/serviceNodePort as
+  # values fields.  The router service is created as ClusterIP by the chart.
+  # We patch it to NodePort explicitly after Helm completes (see below).
   info "Deploying vLLM production stack (model: ${VLLM_MODEL})..."
   helm upgrade --install vllm-stack vllm/vllm-stack \
     --namespace "$VLLM_NAMESPACE" \
@@ -2143,6 +2373,56 @@ EOF
     }
 
   rm -f "$values_file"
+
+  # ── Patch router service to NodePort ──────────────────────────────────────
+  # The vllm-stack chart creates the router service as ClusterIP.
+  # We find the router service by label and patch it to NodePort on VLLM_NODEPORT.
+  info "Patching vLLM router service to NodePort ${VLLM_NODEPORT}..."
+
+  # Wait up to 30s for the service to exist (Helm just ran but CRD/controller
+  # may still be creating it)
+  local svc_name=""
+  local svc_wait=0
+  while (( svc_wait < 30 )); do
+    svc_name=$(kubectl get svc -n "$VLLM_NAMESPACE" \
+      --no-headers 2>/dev/null \
+      | awk '/router/{print $1; exit}')
+    [[ -n "$svc_name" ]] && break
+    sleep 3; svc_wait=$(( svc_wait + 3 ))
+  done
+
+  if [[ -z "$svc_name" ]]; then
+    # Fallback: grab the first (and usually only) service in the namespace
+    svc_name=$(kubectl get svc -n "$VLLM_NAMESPACE" \
+      --no-headers 2>/dev/null | awk 'NR==1{print $1}')
+  fi
+
+  if [[ -z "$svc_name" ]]; then
+    warn "Could not find vLLM router service — NodePort patch skipped."
+    warn "Patch manually:  kubectl patch svc <router-svc> -n ${VLLM_NAMESPACE} \\"
+    warn "  -p '{\"spec\":{\"type\":\"NodePort\",\"ports\":[{\"port\":80,\"nodePort\":${VLLM_NODEPORT}}]}}'"
+  else
+    # Determine the port the router listens on (usually 80 or 8080)
+    local router_port
+    router_port=$(kubectl get svc "$svc_name" -n "$VLLM_NAMESPACE" \
+      -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo "80")
+
+    kubectl patch svc "$svc_name" -n "$VLLM_NAMESPACE" \
+      --type=json \
+      -p="[
+        {\"op\":\"replace\",\"path\":\"/spec/type\",\"value\":\"NodePort\"},
+        {\"op\":\"replace\",\"path\":\"/spec/ports/0/nodePort\",\"value\":${VLLM_NODEPORT}}
+      ]" 2>/dev/null || \
+    kubectl patch svc "$svc_name" -n "$VLLM_NAMESPACE" \
+      -p "{\"spec\":{\"type\":\"NodePort\",\"ports\":[{\"port\":${router_port},\"nodePort\":${VLLM_NODEPORT}}]}}" || {
+        warn "NodePort patch failed — service may already be NodePort or port is taken."
+        warn "Check:  kubectl get svc -n ${VLLM_NAMESPACE}"
+      }
+
+    log "Router service '${svc_name}' patched → NodePort ${VLLM_NODEPORT}"
+    info "Router service:"
+    kubectl get svc "$svc_name" -n "$VLLM_NAMESPACE"
+  fi
 
   # ── Post-deploy readiness poll ─────────────────────────────────────────────
   # Poll for up to 30 minutes.  Print progress every interval.
