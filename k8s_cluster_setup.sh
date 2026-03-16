@@ -18,6 +18,8 @@ trap 'echo "[FATAL] Script aborted at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 # ──────────────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${SCRIPT_DIR}/k8s_install_$(date +%Y%m%d_%H%M%S).log"
+# Symlink updated in main() after LOG_FILE is created
+LATEST_LOG="${SCRIPT_DIR}/k8s_install_latest.log"
 LOCK_FILE="/tmp/k8s_install.lock"
 CONFIG_FILE="${SCRIPT_DIR}/k8s_cluster.conf"
 
@@ -55,8 +57,10 @@ error()   { echo -e "${RED}[$(date '+%H:%M:%S')] ✖  $*${NC}" | tee -a "$LOG_FI
 info()    { echo -e "${CYAN}[$(date '+%H:%M:%S')] ℹ  $*${NC}" | tee -a "$LOG_FILE" || true; }
 section() {
   {
+    local _snum=""
+    [[ -n "${_step:-}" && "${_step}" != "0" ]] && _snum=" [${_step}/${_step_total:-?}]"
     echo -e "\n${BOLD}${BLUE}══════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  $*${NC}"
+    echo -e "${BOLD}${BLUE}  $*${_snum}${NC}"
     echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════${NC}\n"
   } | tee -a "$LOG_FILE" || true
 }
@@ -113,6 +117,15 @@ PROM_STORAGE_SIZE="${PROM_STORAGE_SIZE:-20Gi}"
 NFS_STORAGE_CLASS="${NFS_STORAGE_CLASS:-nfs-client}"
 NFS_DEFAULT_SC="${NFS_DEFAULT_SC:-true}"
 
+# GPU Time-Slicing (NVIDIA MIG alternative for consumer/datacenter GPUs)
+# When enabled the installer patches the GPU Operator device plugin ConfigMap
+# so each physical GPU appears as VLLM_GPU_TIMESLICE_COUNT virtual GPUs.
+# Pods request "nvidia.com/gpu: 1" and share the physical GPU in time slices.
+# Suitable for inference workloads where strict memory isolation is not needed.
+# Set to 0 or "false" to disable time-slicing (default).
+GPU_TIMESLICING_ENABLED="${GPU_TIMESLICING_ENABLED:-false}"
+GPU_TIMESLICE_COUNT="${GPU_TIMESLICE_COUNT:-4}"   # virtual GPUs per physical GPU
+
 # Feature flags (set by wizard; default to true for backward compat)
 INSTALL_NVIDIA="${INSTALL_NVIDIA:-true}"
 INSTALL_MONITORING="${INSTALL_MONITORING:-true}"
@@ -167,7 +180,13 @@ validate_config() {
 
   [[ -z "$CONTROL_PLANE_IP" ]]   && { error "CONTROL_PLANE_IP is not set."; ((errors++)); }
   [[ ${#WORKER_IPS[@]} -eq 0 ]]  && warn "No WORKER_IPS defined — single-node cluster."
-  [[ -z "$NFS_SERVER_IP" ]]      && warn "NFS_SERVER_IP not set — NFS provisioner will be skipped."
+
+  # Auto-correct: if NFS enabled but no server IP given, disable it cleanly
+  if [[ "${INSTALL_NFS:-true}" == "true" && -z "${NFS_SERVER_IP:-}" ]]; then
+    warn "INSTALL_NFS=true but NFS_SERVER_IP is empty — disabling NFS provisioner."
+    warn "Set NFS_SERVER_IP in k8s_cluster.conf to enable NFS storage."
+    INSTALL_NFS="false"
+  fi
 
   if (( errors > 0 )); then
     error "$errors configuration error(s). Edit the CONFIGURATION section and retry."
@@ -551,7 +570,7 @@ fetch_file_from() {
 }
 # ──────────────────────────────────────────────────────────────────────────────
 setup_ssh_keys() {
-  section "Step 1 — Passwordless SSH"
+  section "Step — Passwordless SSH"
 
   if [[ ! -f "${SSH_KEY_PATH}" ]]; then
     info "Generating SSH key pair at ${SSH_KEY_PATH}"
@@ -863,7 +882,7 @@ NODEPREP
 }
 
 prepare_all_nodes() {
-  section "Step 2 — Common Node Preparation"
+  section "Step — Common Node Preparation"
   local prep_script="/tmp/node_prep_$$.sh"
 
   generate_node_prep_script > "$prep_script"
@@ -1177,7 +1196,8 @@ reboot_and_wait() {
            -o ConnectTimeout=8 \
            -o BatchMode=yes \
            "${SSH_USER}@${host}" "true" &>/dev/null; then
-      info "[${host}] SSH is back (${elapsed}s after reboot command)."
+      info "[${host}] SSH is back (${elapsed}s after reboot command) — confirming stability..."
+      sleep 5  # Brief pause: sshd can briefly accept then drop during early boot
       break
     fi
     info "[${host}] Still waiting... (${elapsed}s / ${timeout}s)"
@@ -1304,7 +1324,7 @@ install_nvidia_drivers() {
   done
 
   rm -f "$phase1_script" "$phase2_script"
-  section "Step 3 — NVIDIA Installation Complete (all nodes)"
+  section "Step — NVIDIA Installation Complete (all nodes)"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1354,7 +1374,7 @@ K8SBINEOF
 }
 
 install_k8s_binaries() {
-  section "Step 4 — Kubernetes Binaries (kubeadm / kubelet / kubectl)"
+  section "Step — Kubernetes Binaries (kubeadm / kubelet / kubectl)"
   local bin_script="/tmp/k8s_binaries_$$.sh"
   generate_k8s_binaries_script "$K8S_VERSION" > "$bin_script"
   chmod 700 "$bin_script"   # owner execute; SCP sends readable file to remote
@@ -1376,20 +1396,26 @@ install_k8s_binaries() {
 # STEP 5 — Initialize Control Plane
 # ──────────────────────────────────────────────────────────────────────────────
 init_control_plane() {
-  section "Step 5 — Initializing Control Plane on ${CONTROL_PLANE_IP}"
+  section "Step — Initializing Control Plane on ${CONTROL_PLANE_IP}"
 
   # Write the init script to a temp file directly (avoid heredoc-in-$() which
   # strips trailing newlines and can misfire under set -e).
   local init_file="/tmp/cp_init_$$.sh"
 
-  cat > "$init_file" <<INITEOF
+  # Quoted heredoc — outer variables injected via sed so the script is
+  # completely literal inside the file, with no shell-expansion surprises.
+  sed \
+    -e "s|__CP_IP__|${CONTROL_PLANE_IP}|g" \
+    -e "s|__POD_CIDR__|${POD_CIDR}|g" \
+    -e "s|__SSH_USER__|${SSH_USER}|g" \
+    > "$init_file" <<'INITEOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 echo "[control-plane] Running kubeadm init..."
-kubeadm init \\
-  --apiserver-advertise-address=${CONTROL_PLANE_IP} \\
-  --pod-network-cidr=${POD_CIDR} \\
+kubeadm init \
+  --apiserver-advertise-address=__CP_IP__ \
+  --pod-network-cidr=__POD_CIDR__ \
   --upload-certs 2>&1
 
 # ── kubectl for root ──────────────────────────────────────────────────────────
@@ -1399,13 +1425,13 @@ cp -f /etc/kubernetes/admin.conf /root/.kube/config
 chmod 600 /root/.kube/config
 
 # ── kubectl for SSH_USER (if different from root) ─────────────────────────────
-SSH_USER_HOME=\$(getent passwd "${SSH_USER}" | cut -d: -f6 2>/dev/null || echo "/home/${SSH_USER}")
-if [[ -d "\${SSH_USER_HOME}" && "\${SSH_USER_HOME}" != "/root" ]]; then
-  echo "[control-plane] Configuring kubectl for ${SSH_USER} in \${SSH_USER_HOME}..."
-  mkdir -p "\${SSH_USER_HOME}/.kube"
-  cp -f /etc/kubernetes/admin.conf "\${SSH_USER_HOME}/.kube/config"
-  chown ${SSH_USER}:${SSH_USER} "\${SSH_USER_HOME}/.kube/config"
-  chmod 600 "\${SSH_USER_HOME}/.kube/config"
+SSH_USER_HOME=$(getent passwd "__SSH_USER__" | cut -d: -f6 2>/dev/null || echo "/home/__SSH_USER__")
+if [[ -d "${SSH_USER_HOME}" && "${SSH_USER_HOME}" != "/root" ]]; then
+  echo "[control-plane] Configuring kubectl for __SSH_USER__ in ${SSH_USER_HOME}..."
+  mkdir -p "${SSH_USER_HOME}/.kube"
+  cp -f /etc/kubernetes/admin.conf "${SSH_USER_HOME}/.kube/config"
+  chown __SSH_USER__:__SSH_USER__ "${SSH_USER_HOME}/.kube/config"
+  chmod 600 "${SSH_USER_HOME}/.kube/config"
 fi
 
 # ── Join command for workers ───────────────────────────────────────────────────
@@ -1462,17 +1488,30 @@ INITEOF
 # STEP 6 — Install CNI Plugin
 # ──────────────────────────────────────────────────────────────────────────────
 install_cni() {
-  section "Step 6 — Installing CNI Plugin (${CNI_PLUGIN})"
-  export KUBECONFIG="/root/.kube/config"
+  section "Step — Installing CNI Plugin (${CNI_PLUGIN})"
+  # KUBECONFIG exported globally after init_control_plane
+
+  # Helper: apply a manifest URL with up to 3 retries and 10s backoff
+  _kubectl_apply_url() {
+    local url="$1" attempt=1
+    while (( attempt <= 3 )); do
+      if kubectl apply -f "$url"; then return 0; fi
+      warn "kubectl apply attempt ${attempt}/3 failed — retrying in 10s..."
+      sleep 10
+      attempt=$(( attempt + 1 ))
+    done
+    error "kubectl apply failed after 3 attempts: ${url}"
+    return 1
+  }
+
+  local FLANNEL_VERSION="v0.26.2"   # pinned — update deliberately
 
   if [[ "$CNI_PLUGIN" == "flannel" ]]; then
-    kubectl apply -f \
-      https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+    _kubectl_apply_url       "https://github.com/flannel-io/flannel/releases/download/${FLANNEL_VERSION}/kube-flannel.yml"
 
   elif [[ "$CNI_PLUGIN" == "calico" ]]; then
     # Apply the Calico manifest
-    kubectl apply -f \
-      https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
+    _kubectl_apply_url       "https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml"
 
     # ── Switch Calico from IPIP to VXLAN ──────────────────────────────────────
     # Calico defaults to IPIP (IP protocol 4) for cross-node pod traffic.
@@ -1529,7 +1568,7 @@ EOF
 # STEP 7 — Join Worker Nodes
 # ──────────────────────────────────────────────────────────────────────────────
 join_workers() {
-  section "Step 7 — Joining Worker Nodes"
+  section "Step — Joining Worker Nodes"
   if [[ ${#WORKER_IPS[@]} -eq 0 ]]; then
     warn "No worker nodes defined — skipping join step."
     return
@@ -1540,7 +1579,22 @@ join_workers() {
 
   for worker in "${WORKER_IPS[@]}"; do
     info "Joining worker ${worker}..."
-    run_on "$worker" "${join_cmd}"
+    # Write join command to a script file and run via run_script_on.
+    # run_on passes the command as a single shell argument — the join command
+    # contains --token and --discovery-token-ca-cert-hash which risk being
+    # word-split or misinterpreted by remote sudo bash -c.
+    local join_script="/tmp/k8s_worker_join_$$.sh"
+    printf '#!/usr/bin/env bash
+set -euo pipefail
+%s
+' "${join_cmd}" > "$join_script"
+    chmod 600 "$join_script"
+    run_script_on "$worker" "$join_script" || {
+      error "Worker join failed on ${worker}."
+      rm -f "$join_script"
+      exit 1
+    }
+    rm -f "$join_script"
     log "Worker ${worker} joined the cluster."
   done
 
@@ -1599,11 +1653,16 @@ join_workers() {
 # STEP 8 — Install Helm
 # ──────────────────────────────────────────────────────────────────────────────
 install_helm() {
-  section "Step 8 — Installing Helm ${HELM_VERSION}"
+  section "Step — Installing Helm ${HELM_VERSION}"
 
   if command -v helm &>/dev/null; then
-    warn "Helm already installed: $(helm version --short)"
-    return
+    local installed_ver
+    installed_ver=$(helm version --short 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [[ "$installed_ver" == "$HELM_VERSION" ]]; then
+      log "Helm ${HELM_VERSION} already installed — skipping."
+      return
+    fi
+    warn "Helm ${installed_ver} installed but ${HELM_VERSION} requested — upgrading..."
   fi
 
   local helm_tar="/tmp/helm-v${HELM_VERSION}.tar.gz"
@@ -1631,8 +1690,8 @@ install_helm() {
 # time to bind it — avoids the pod staying in Pending indefinitely.
 # ──────────────────────────────────────────────────────────────────────────────
 install_monitoring() {
-  section "Step 10 — Prometheus & Grafana (kube-prometheus-stack)"
-  export KUBECONFIG="/root/.kube/config"
+  section "Step — Prometheus & Grafana (kube-prometheus-stack)"
+  # KUBECONFIG exported globally after init_control_plane
 
   if [[ "${INSTALL_MONITORING}" != "true" ]]; then
     warn "INSTALL_MONITORING=false — skipping monitoring stack."
@@ -1733,7 +1792,7 @@ PROMPVC
     --wait --timeout=10m
 
   log "kube-prometheus-stack deployed in namespace ${NS_MONITORING}."
-  info "Grafana:      http://${CONTROL_PLANE_IP}:${GRAFANA_NODEPORT}  (admin / ${GRAFANA_ADMIN_PASSWORD})"
+  info "Grafana:      http://${CONTROL_PLANE_IP}:${GRAFANA_NODEPORT}  (admin / ****)"
   info "Prometheus:   http://${CONTROL_PLANE_IP}:${PROMETHEUS_NODEPORT}"
   info "Alertmanager: http://${CONTROL_PLANE_IP}:${ALERTMANAGER_NODEPORT}"
 }
@@ -1742,8 +1801,8 @@ PROMPVC
 # STEP 10 — NVIDIA GPU Operator
 # ──────────────────────────────────────────────────────────────────────────────
 install_gpu_operator() {
-  section "Step 11 — NVIDIA GPU Operator"
-  export KUBECONFIG="/root/.kube/config"
+  section "Step — NVIDIA GPU Operator"
+  # KUBECONFIG exported globally after init_control_plane
 
   if [[ "${INSTALL_NVIDIA}" != "true" ]]; then
     warn "INSTALL_NVIDIA=false — skipping GPU Operator."
@@ -1811,8 +1870,8 @@ install_gpu_operator() {
 # STEP 9 — NFS External Provisioner
 # ──────────────────────────────────────────────────────────────────────────────
 install_nfs_provisioner() {
-  section "Step 9 — NFS External Provisioner"
-  export KUBECONFIG="/root/.kube/config"
+  section "Step — NFS External Provisioner"
+  # KUBECONFIG exported globally after init_control_plane
 
   if [[ "${INSTALL_NFS}" != "true" ]]; then
     warn "INSTALL_NFS=false — skipping NFS provisioner."
@@ -1957,8 +2016,8 @@ NFSSCRIPT
 # STEP 12 — Kubernetes Dashboard v2.7.0
 # ──────────────────────────────────────────────────────────────────────────────
 install_dashboard() {
-  section "Step 12 — Kubernetes Dashboard v${DASHBOARD_VERSION}"
-  export KUBECONFIG="/root/.kube/config"
+  section "Step — Kubernetes Dashboard v${DASHBOARD_VERSION}"
+  # KUBECONFIG exported globally after init_control_plane
 
   if [[ "${INSTALL_DASHBOARD}" != "true" ]]; then
     warn "INSTALL_DASHBOARD=false — skipping Kubernetes Dashboard."
@@ -2039,8 +2098,8 @@ DASHTOK
 # STEP 13 — vLLM Production Stack
 # ──────────────────────────────────────────────────────────────────────────────
 install_vllm() {
-  section "Step 13 — vLLM Production Stack"
-  export KUBECONFIG="/root/.kube/config"
+  section "Step — vLLM Production Stack"
+  # KUBECONFIG exported globally after init_control_plane
 
   if [[ "${INSTALL_VLLM}" != "true" ]]; then
     warn "INSTALL_VLLM=false — skipping vLLM stack."
@@ -2500,21 +2559,260 @@ EOF
 # ──────────────────────────────────────────────────────────────────────────────
 # STEP 14 — Post-install verification
 # ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# GPU TIME-SLICING — NVIDIA GPU time-slicing via device plugin ConfigMap
+#
+# Time-slicing lets multiple pods share a single physical GPU in time slices.
+# Each physical GPU advertises GPU_TIMESLICE_COUNT virtual GPUs to the
+# scheduler.  Pods request "nvidia.com/gpu: 1" normally and are scheduled
+# onto time slices transparently.
+#
+# Difference from MIG (Multi-Instance GPU):
+#   MIG  — hard memory partitioning, requires Ampere+ (A100, A30, H100)
+#   Time-slicing — soft time sharing, works on ANY NVIDIA GPU (even consumer)
+#
+# Caveats:
+#   • No memory isolation — pods share the same VRAM, OOM kills all slices
+#   • Context-switch overhead — heavier workloads see latency spikes
+#   • Best for lightweight inference / dev workloads, not training
+#
+# Reference: https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/
+#            latest/gpu-sharing.html
+# ──────────────────────────────────────────────────────────────────────────────
+configure_gpu_timeslicing() {
+  section "GPU Time-Slicing Configuration"
+  # KUBECONFIG exported globally after init_control_plane
+
+  if [[ "${INSTALL_NVIDIA:-false}" != "true" ]]; then
+    info "INSTALL_NVIDIA=false — skipping GPU time-slicing."
+    return
+  fi
+
+  if [[ "${GPU_TIMESLICING_ENABLED:-false}" != "true" ]]; then
+    info "GPU_TIMESLICING_ENABLED=false — skipping GPU time-slicing."
+    info "To enable: set GPU_TIMESLICING_ENABLED=true GPU_TIMESLICE_COUNT=<n>"
+    info "           in k8s_cluster.conf and re-run --step gpu-timeslice"
+    return
+  fi
+
+  local count="${GPU_TIMESLICE_COUNT:-4}"
+  info "Configuring GPU time-slicing: ${count} virtual GPUs per physical GPU."
+
+  # ── Step 1: Create the device plugin ConfigMap ────────────────────────────
+  # The GPU Operator reads this ConfigMap to configure the device plugin.
+  # 'replicas' controls how many virtual GPUs each physical GPU exposes.
+  info "Creating time-slicing ConfigMap in ${NS_GPU_OPERATOR}..."
+  kubectl create namespace "${NS_GPU_OPERATOR}"     --dry-run=client -o yaml | kubectl apply -f -
+
+  kubectl apply -f - <<TSCONFIG
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: time-slicing-config
+  namespace: ${NS_GPU_OPERATOR}
+data:
+  any: |-
+    version: v1
+    flags:
+      migStrategy: none
+    sharing:
+      timeSlicing:
+        renameByDefault: false
+        failRequestsGreaterThanOne: false
+        resources:
+          - name: nvidia.com/gpu
+            replicas: ${count}
+TSCONFIG
+
+  log "Time-slicing ConfigMap created (${count} replicas per GPU)."
+
+  # ── Step 2: Patch GPU Operator to use the ConfigMap ───────────────────────
+  # The ClusterPolicy CR tells the GPU Operator which ConfigMap to use for
+  # the device plugin.  We patch it via kubectl — works whether the CR already
+  # exists or is being created fresh.
+  info "Patching GPU Operator ClusterPolicy to use time-slicing config..."
+
+  local cp_exists=false
+  if kubectl get clusterpolicy gpu-cluster-policy        -n "${NS_GPU_OPERATOR}" &>/dev/null 2>&1; then
+    cp_exists=true
+  fi
+
+  if $cp_exists; then
+    kubectl patch clusterpolicy gpu-cluster-policy       -n "${NS_GPU_OPERATOR}"       --type=merge       -p "{
+        "spec": {
+          "devicePlugin": {
+            "config": {
+              "name": "time-slicing-config",
+              "default": "any"
+            }
+          }
+        }
+      }" && log "ClusterPolicy patched for time-slicing." ||       warn "ClusterPolicy patch failed — GPU Operator may not be ready yet."
+  else
+    warn "ClusterPolicy 'gpu-cluster-policy' not found in ${NS_GPU_OPERATOR}."
+    warn "GPU Operator may still be installing — re-run after it is ready:"
+    warn "  sudo bash $(basename "$0") --step gpu-timeslice"
+    return
+  fi
+
+  # ── Step 3: Label nodes to use the time-slicing config ───────────────────
+  info "Labelling GPU nodes to apply time-slicing config..."
+  local labeled=0
+  for node in "${WORKER_IPS[@]:-}" "${CONTROL_PLANE_IP}"; do
+    [[ -z "$node" ]] && continue
+    if run_on "$node" "lspci 2>/dev/null | grep -qi nvidia" 2>/dev/null; then
+      local node_name
+      node_name=$(kubectl get nodes         -o jsonpath='{range .items[*]}{.metadata.name}{"	"}{range .status.addresses[*]}{.type}{"	"}{.address}{"
+"}{end}{end}'         2>/dev/null         | awk -v ip="$node" '$2=="InternalIP" && $3==ip {print $1; exit}')
+      if [[ -n "$node_name" ]]; then
+        kubectl label node "$node_name"           nvidia.com/device-plugin.config=any --overwrite
+        info "  Labelled ${node_name} (${node}) → nvidia.com/device-plugin.config=any"
+        labeled=$(( labeled + 1 ))
+      fi
+    fi
+  done
+
+  if (( labeled == 0 )); then
+    warn "No GPU nodes found to label — time-slicing may not activate."
+  fi
+
+  # ── Step 4: Restart device plugin to pick up new config ──────────────────
+  info "Restarting NVIDIA device plugin DaemonSet..."
+  kubectl rollout restart daemonset/nvidia-device-plugin-daemonset     -n "${NS_GPU_OPERATOR}" 2>/dev/null ||   kubectl rollout restart     $(kubectl get daemonset -n "${NS_GPU_OPERATOR}"       --no-headers 2>/dev/null | awk '/device-plugin/{print $1}' | head -1)     -n "${NS_GPU_OPERATOR}" 2>/dev/null ||     warn "Could not restart device plugin DaemonSet — may need manual restart."
+
+  # ── Step 5: Verify virtual GPU count ────────────────────────────────────
+  info "Waiting 30s for device plugin to re-register resources..."
+  sleep 30
+
+  local total_virtual=0
+  local nodes_checked=0
+  while IFS= read -r node_name; do
+    [[ -z "$node_name" ]] && continue
+    local vgpu_count
+    vgpu_count=$(kubectl get node "$node_name"       -o jsonpath='{.status.allocatable.nvidia\.com/gpu}' 2>/dev/null || echo "0")
+    if (( ${vgpu_count:-0} > 0 )); then
+      info "  ${node_name}: ${vgpu_count} virtual GPU(s) available"
+      total_virtual=$(( total_virtual + vgpu_count ))
+      nodes_checked=$(( nodes_checked + 1 ))
+    fi
+  done < <(kubectl get nodes -l nvidia.com/gpu.present=true     --no-headers 2>/dev/null | awk '{print $1}')
+
+  if (( total_virtual > 0 )); then
+    log "GPU time-slicing active: ${total_virtual} total virtual GPU(s) across ${nodes_checked} node(s)."
+    log "Each physical GPU is presenting ${count} virtual GPUs to the scheduler."
+  else
+    warn "No virtual GPUs detected yet — device plugin may still be restarting."
+    warn "Check: kubectl get nodes -o json | jq '.items[].status.allocatable'"
+  fi
+
+  info ""
+  info "Usage example — deploy a pod requesting one virtual GPU slice:"
+  info "  resources:"
+  info "    limits:"
+  info "      nvidia.com/gpu: 1   # gets 1/${count} of a physical GPU"
+  info ""
+  info "To disable time-slicing later:"
+  info "  kubectl delete configmap time-slicing-config -n ${NS_GPU_OPERATOR}"
+  info "  kubectl patch clusterpolicy gpu-cluster-policy -n ${NS_GPU_OPERATOR} --type=merge -p PATCH"
+  # (replace PATCH with: {"spec":{"devicePlugin":{"config":{"name":""}}}})
+}
+
+
+# _verify_check_port — top-level helper for verify_cluster.
+# Bash does not reliably support nested function definitions inside functions
+# that use pipes/subshells, so this must live at the top level.
+# Uses global _verify_failed counter set by verify_cluster.
+_verify_check_port() {
+  local name="$1" port="$2" enabled="${3:-true}"
+  [[ "$enabled" != "true" ]] && return
+  local ok=false
+  if command -v nc &>/dev/null; then
+    nc -z -w3 "$CONTROL_PLANE_IP" "$port" &>/dev/null 2>&1 && ok=true || true
+  else
+    (echo >/dev/tcp/"$CONTROL_PLANE_IP"/"$port") &>/dev/null 2>&1 && ok=true || true
+  fi
+  if $ok; then
+    log "  ${name} :${port} -- reachable"
+  else
+    warn "  ${name} :${port} -- NOT reachable (service may still be starting)"
+    _verify_failed=$(( _verify_failed + 1 ))
+  fi
+}
+
 verify_cluster() {
-  section "Step 14 — Post-install Verification"
-  export KUBECONFIG="/root/.kube/config"
+  section "Post-install Verification"
+  # KUBECONFIG exported globally after init_control_plane
 
-  info "Cluster nodes:"
-  kubectl get nodes -o wide
+  _verify_failed=0
 
-  info "All pods (all namespaces):"
-  kubectl get pods --all-namespaces
+  # ── Nodes ─────────────────────────────────────────────────────────────────
+  info "── Nodes ──────────────────────────────────────────────────────────────"
+  kubectl get nodes -o wide | tee -a "$LOG_FILE"
+  local not_ready
+  not_ready=$(kubectl get nodes --no-headers 2>/dev/null     | awk '$2 != "Ready" {print $1}')
+  if [[ -n "$not_ready" ]]; then
+    warn "Nodes NOT Ready: ${not_ready}"
+    _verify_failed=$(( _verify_failed + 1 ))
+  else
+    log "All nodes are Ready."
+  fi
 
-  info "Storage classes:"
-  kubectl get storageclasses
+  # ── Pods ──────────────────────────────────────────────────────────────────
+  info "── Pods ───────────────────────────────────────────────────────────────"
+  kubectl get pods --all-namespaces | tee -a "$LOG_FILE"
 
-  info "Services:"
-  kubectl get svc --all-namespaces | grep -E 'NodePort|LoadBalancer'
+  local bad_pods
+  bad_pods=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null     | awk '$4~/CrashLoopBackOff|Error|OOMKilled|ImagePullBackOff|Evicted/ {print $1"/"$2" "$4}')
+  if [[ -n "$bad_pods" ]]; then
+    warn "Pods in failed state:"
+    while IFS= read -r p; do warn "  ${p}"; done <<< "$bad_pods"
+    _verify_failed=$(( _verify_failed + 1 ))
+  else
+    log "No pods in failed state."
+  fi
+
+  local pending_pods
+  pending_pods=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null     | awk '$4=="Pending" {print $1"/"$2}')
+  if [[ -n "$pending_pods" ]]; then
+    warn "Pods still Pending (may still be starting):"
+    while IFS= read -r p; do warn "  ${p}"; done <<< "$pending_pods"
+  fi
+
+  # ── CoreDNS resolution ────────────────────────────────────────────────────
+  info "── DNS Resolution Test ─────────────────────────────────────────────────"
+  local dns_pod="dns-verify-$$"
+  if kubectl run "$dns_pod"        --image=busybox:1.36 --rm --restart=Never        --timeout=60s -i --quiet        -- nslookup kubernetes.default.svc.cluster.local        &>/dev/null 2>&1; then
+    log "CoreDNS: kubernetes.default.svc.cluster.local resolves OK."
+  else
+    warn "CoreDNS resolution test failed or timed out."
+    warn "Run: kubectl get pods -n kube-system -l k8s-app=kube-dns"
+    _verify_failed=$(( _verify_failed + 1 ))
+  fi
+  kubectl delete pod "$dns_pod" --ignore-not-found &>/dev/null 2>&1 || true
+
+  # ── Storage ───────────────────────────────────────────────────────────────
+  info "── Storage Classes ─────────────────────────────────────────────────────"
+  kubectl get storageclasses | tee -a "$LOG_FILE"
+
+  # ── Services & NodePorts ──────────────────────────────────────────────────
+  info "── NodePort / LoadBalancer Services ───────────────────────────────────"
+  kubectl get svc --all-namespaces     | grep -E 'NodePort|LoadBalancer' | tee -a "$LOG_FILE"     || info "No NodePort/LoadBalancer services found."
+
+  # ── NodePort reachability spot-checks ────────────────────────────────────
+  info "── NodePort Reachability Checks ───────────────────────────────────────"
+  _verify_check_port "Grafana"     "${GRAFANA_NODEPORT}"    "${INSTALL_MONITORING:-false}"
+  _verify_check_port "Prometheus"  "${PROMETHEUS_NODEPORT}" "${INSTALL_MONITORING:-false}"
+  _verify_check_port "Dashboard"   "${DASHBOARD_NODEPORT}"  "${INSTALL_DASHBOARD:-false}"
+  _verify_check_port "vLLM Router" "${VLLM_NODEPORT}"       "${INSTALL_VLLM:-false}"
+
+  # ── Summary ───────────────────────────────────────────────────────────────
+  echo ""
+  if (( _verify_failed == 0 )); then
+    log "Verification passed — cluster looks healthy."
+  else
+    warn "Verification completed with ${_verify_failed} issue(s). Review warnings above."
+    warn "Re-run a step:  sudo bash $(basename "$0") --step <step>"
+  fi
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2549,7 +2847,7 @@ _try() {
 
 uninstall_cluster() {
   section "Kubernetes Cluster — UNINSTALL"
-  export KUBECONFIG="/root/.kube/config"
+  # KUBECONFIG exported globally after init_control_plane
 
   echo -e "${RED}${BOLD}"
   echo "  ╔══════════════════════════════════════════════════════════════╗"
@@ -2871,30 +3169,50 @@ NFSRM
 main() {
   section "Kubernetes Cluster Installer — Ubuntu 24.04"
   info "Log file: ${LOG_FILE}"
+  # Symlink latest log for easy access on re-runs
+  ln -sf "$LOG_FILE" "${SCRIPT_DIR}/k8s_install_latest.log" 2>/dev/null || true
 
   check_root
   check_lock
   validate_config
 
-  setup_ssh_keys
-  prepare_all_nodes
-  install_nvidia_drivers
-  install_k8s_binaries
-  init_control_plane
-  install_cni
-  join_workers
-  install_helm
-  install_nfs_provisioner
-  install_monitoring
-  install_gpu_operator
-  install_dashboard
-  install_vllm
-  verify_cluster
+  _step=0
+  _step_total=14
+  _next_step() { _step=$(( _step + 1 )); info ""; info "════ Step ${_step}/${_step_total} ════"; }
+
+  _next_step; setup_ssh_keys
+  _next_step; prepare_all_nodes
+  _next_step; install_nvidia_drivers
+  _next_step; install_k8s_binaries
+  _next_step; init_control_plane
+
+  # Export KUBECONFIG globally once after init — all subsequent steps inherit it
+  export KUBECONFIG="/root/.kube/config"
+
+  # Single-node cluster: remove the control-plane NoSchedule taint so pods can
+  # be scheduled on the control plane (kubeadm sets it by default).
+  if [[ ${#WORKER_IPS[@]} -eq 0 ]]; then
+    info "Single-node cluster detected — removing control-plane NoSchedule taint..."
+    kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule-       2>/dev/null || true
+    kubectl taint nodes --all node-role.kubernetes.io/master:NoSchedule-       2>/dev/null || true
+    log "Control-plane taint removed — workloads can now schedule on this node."
+  fi
+
+  _next_step; install_cni
+  _next_step; join_workers
+  _next_step; install_helm
+  _next_step; install_nfs_provisioner
+  _next_step; install_monitoring
+  _next_step; install_gpu_operator
+  _next_step; configure_gpu_timeslicing
+  _next_step; install_dashboard
+  _next_step; install_vllm
+  _next_step; verify_cluster
 
   section "Installation Complete!"
   log "Cluster is up and running."
-  info "KUBECONFIG: ${HOME}/.kube/config"
-  info "Run: export KUBECONFIG=${HOME}/.kube/config"
+  info "KUBECONFIG: /root/.kube/config"
+  info "Run: export KUBECONFIG=/root/.kube/config"
   info "Then: kubectl get nodes"
 }
 
@@ -2931,6 +3249,8 @@ elif [[ "${1:-}" == "--step" && -n "${2:-}" ]]; then
                                     install_monitoring ;;
     gpu-op|"gpu op"|"GPU Operator"|"gpu operator"|"gpu-operator")
                                     install_gpu_operator ;;
+    gpu-timeslice|"gpu timeslice"|"timeslice"|"time-slicing"|"gpu-timeslicing")
+                                    configure_gpu_timeslicing ;;
     dashboard|"Dashboard"|"Kubernetes Dashboard"|"kubernetes dashboard")
                                     install_dashboard ;;
     vllm|"vLLM"|"VLLM"|"vLLM Stack"|"vLLM Production Stack"|"vllm stack"|"vllm production stack")
@@ -2943,7 +3263,7 @@ elif [[ "${1:-}" == "--step" && -n "${2:-}" ]]; then
       error ""
       error "Valid step names:"
       error "  ssh  prep  nvidia  k8s-bins  init  cni  workers"
-      error "  helm  nfs  monitoring  gpu-op  dashboard  vllm  verify"
+      error "  helm  nfs  monitoring  gpu-op  gpu-timeslice  dashboard  vllm  verify"
       exit 1
       ;;
   esac
