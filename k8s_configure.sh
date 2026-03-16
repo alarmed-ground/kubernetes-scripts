@@ -542,6 +542,25 @@ collect_nvidia() {
     ok "Fabric Manager: ${NVIDIA_FABRIC_MANAGER}"
     echo ""
 
+    # ── GPU Time-Slicing ──────────────────────────────────────────────────────
+    echo -e "  ${BOLD}${BLUE}  GPU Time-Slicing:${NC}"
+    echo -e "  ${DIM}  Expose multiple virtual GPUs per physical GPU.${NC}"
+    echo -e "  ${DIM}  Useful for sharing one GPU across multiple inference pods.${NC}"
+    echo -e "  ${DIM}  No memory isolation — all slices share VRAM. Works on any GPU.${NC}"
+    echo ""
+    prompt_yes_no GPU_TIMESLICING_ENABLED "Enable GPU time-slicing?" "n"
+    if [[ "$GPU_TIMESLICING_ENABLED" == "true" ]]; then
+      while true; do
+        prompt_input GPU_TIMESLICE_COUNT "Virtual GPUs per physical GPU" "4"
+        [[ "$GPU_TIMESLICE_COUNT" =~ ^[2-9]$|^[1-9][0-9]+$ ]]           && ok "Time-slicing: ${GPU_TIMESLICE_COUNT}x virtual GPUs per physical GPU"           && break
+        err "Must be an integer >= 2."
+      done
+    else
+      GPU_TIMESLICE_COUNT="4"
+      ok "GPU time-slicing: disabled"
+    fi
+    echo ""
+
     echo -e "  ${BOLD}${BLUE}  Reboot Timeout:${NC}"
     echo -e "  ${DIM}  After the driver installs, each node reboots. This is the max seconds${NC}"
     echo -e "  ${DIM}  to wait per node for SSH to return. Slow hardware may need 600s.${NC}"
@@ -558,6 +577,8 @@ collect_nvidia() {
     NVIDIA_OPEN_KERNEL="false"
     NVIDIA_FABRIC_MANAGER="auto"
     NVIDIA_REBOOT_TIMEOUT="300"
+    GPU_TIMESLICING_ENABLED="false"
+    GPU_TIMESLICE_COUNT="4"
     warn_msg "Skipping NVIDIA. GPU Operator will also be skipped."
   fi
 
@@ -971,8 +992,14 @@ print_summary() {
   else
     echo -e "  NFS            : $(echo -e "${nfs_status}")"
   fi
-  [[ "$INSTALL_NVIDIA" == "true" ]] && \
-    echo -e "  GPU Operator   : ${GREEN}✔${NC}  (ns: ${NS_GPU_OPERATOR})"
+  [[ "$INSTALL_NVIDIA" == "true" ]] &&     echo -e "  GPU Operator   : ${GREEN}✔${NC}  (ns: ${NS_GPU_OPERATOR})"
+  if [[ "$INSTALL_NVIDIA" == "true" ]]; then
+    if [[ "${GPU_TIMESLICING_ENABLED:-false}" == "true" ]]; then
+      echo -e "  GPU Timeslicing: ${GREEN}✔ ${GPU_TIMESLICE_COUNT}x virtual GPUs per physical GPU${NC}"
+    else
+      echo -e "  GPU Timeslicing: ${DIM}disabled${NC}"
+    fi
+  fi
   if [[ "$INSTALL_DASHBOARD" == "true" ]]; then
     echo -e "  Dashboard      : $(echo -e "${dash_status}")"
     echo -e "    URL          : ${CYAN}https://${CONTROL_PLANE_IP}:${DASHBOARD_NODEPORT}${NC}"
@@ -1095,6 +1122,8 @@ NFS_DEFAULT_SC="${NFS_DEFAULT_SC}"
 
 # ── GPU Operator ──────────────────────────────────────────────────────────────
 NS_GPU_OPERATOR="${NS_GPU_OPERATOR}"
+GPU_TIMESLICING_ENABLED="${GPU_TIMESLICING_ENABLED}"
+GPU_TIMESLICE_COUNT="${GPU_TIMESLICE_COUNT}"
 
 # ── Kubernetes Dashboard ──────────────────────────────────────────────────────
 INSTALL_DASHBOARD="${INSTALL_DASHBOARD}"
@@ -1174,6 +1203,8 @@ patch_installer() {
       -v vllm_stosize="$VLLM_STORAGE_SIZE" \
       -v vllm_reuse="$VLLM_REUSE_PVC" \
       -v vllm_pvc="$VLLM_PVC_NAME" \
+      -v gts_en="$GPU_TIMESLICING_ENABLED" \
+      -v gts_cnt="$GPU_TIMESLICE_COUNT" \
       -v workers="$worker_arr_str" \
   'BEGIN { in_conf=0 }
    /^# CONFIGURATION — Edit these values/ { in_conf=1 }
@@ -1216,6 +1247,8 @@ patch_installer() {
    in_conf && /^VLLM_STORAGE_SIZE=/ { print "VLLM_STORAGE_SIZE=\"" vllm_stosize "\""; next }
    in_conf && /^VLLM_REUSE_PVC=/    { print "VLLM_REUSE_PVC=\"" vllm_reuse "\""; next }
    in_conf && /^VLLM_PVC_NAME=/     { print "VLLM_PVC_NAME=\"" vllm_pvc "\""; next }
+   in_conf && /^GPU_TIMESLICING_ENABLED=/ { print "GPU_TIMESLICING_ENABLED=\"" gts_en "\""; next }
+   in_conf && /^GPU_TIMESLICE_COUNT=/     { print "GPU_TIMESLICE_COUNT=\"" gts_cnt "\""; next }
    /^# ─.*SANITY CHECKS/ { in_conf=0 }
    { print }' "$INSTALLER" > "$tmp"
 
