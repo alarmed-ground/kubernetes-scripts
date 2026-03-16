@@ -1,14 +1,30 @@
 #!/usr/bin/env bash
 # =============================================================================
-# k8s_configure.sh — Interactive Configuration Wizard
-# Collects all cluster parameters, validates them, writes k8s_cluster.conf,
-# and optionally launches the installer.
+# k8s_configure.sh — Interactive Configuration Wizard  v2
+#
+# Improvements over v1:
+#   • --section <name>  re-run a single section without the full wizard
+#   • --preflight       run pre-flight checks only (SSH, ping, disk, ports)
+#   • --show            print the current config file and exit
+#   • Config file versioning (CONF_VERSION=2) with forward-migration
+#   • Pre-flight checks embedded before saving (ping nodes, test SSH port,
+#     check disk space, verify NFS reachability, detect NodePort conflicts)
+#   • Inline editing — after the summary you can jump back to any section
+#     instead of being forced to restart the entire wizard
+#   • NodePort conflict detection across all configured services
+#   • SSH connectivity test with actionable error messages
+#   • Disk space check on local machine before saving
+#   • NFS export reachability test (showmount / nc fallback)
+#   • GPU count auto-suggestion based on worker count
+#   • Model size vs memory guard for vLLM
+#   • Section names printed in the offer_launch reference table
 # =============================================================================
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/k8s_cluster.conf"
 INSTALLER="${SCRIPT_DIR}/k8s_cluster_setup.sh"
+CONF_VERSION=2
 
 # ──────────────────────────────────────────────────────────────────────────────
 # COLORS & UI PRIMITIVES
@@ -17,7 +33,6 @@ RED='\033[0;31m';    GREEN='\033[0;32m';  YELLOW='\033[1;33m'
 BLUE='\033[0;34m';   CYAN='\033[0;36m';  MAGENTA='\033[0;35m'
 BOLD='\033[1m';      DIM='\033[2m';      NC='\033[0m'
 
-# Symbols
 SYM_OK="✔";  SYM_ERR="✖";  SYM_WARN="⚠";  SYM_ARROW="▶";  SYM_DOT="•"
 
 print_header() {
@@ -25,7 +40,7 @@ print_header() {
   echo -e "${BOLD}${BLUE}"
   echo "  ╔══════════════════════════════════════════════════════════════╗"
   echo "  ║       Kubernetes Cluster Installer — Configuration Wizard    ║"
-  echo "  ║                      Ubuntu 24.04                           ║"
+  echo "  ║                      Ubuntu 24.04                            ║"
   echo "  ╚══════════════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 }
@@ -49,8 +64,8 @@ ok()      { echo -e "  ${GREEN}${SYM_OK}  $*${NC}"; }
 err()     { echo -e "  ${RED}${SYM_ERR}  $*${NC}"; }
 warn_msg(){ echo -e "  ${YELLOW}${SYM_WARN}  $*${NC}"; }
 label()   { echo -e "  ${BOLD}${SYM_ARROW} $*${NC}"; }
+info_msg(){ echo -e "  ${BLUE}${SYM_DOT} $*${NC}"; }
 
-# Progress bar across sections
 TOTAL_SECTIONS=10
 CURRENT_SECTION=0
 show_progress() {
@@ -66,47 +81,22 @@ show_progress() {
 # ──────────────────────────────────────────────────────────────────────────────
 # INPUT HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
-
-# prompt_input VAR_NAME "Question" "default" ["secret"]
 prompt_input() {
-  local var_name="$1"
-  local question="$2"
-  local default="${3:-}"
-  local secret="${4:-}"
-  local input=""
-
+  local var_name="$1" question="$2" default="${3:-}" secret="${4:-}" input=""
   while true; do
     if [[ -n "$default" ]]; then
       echo -ne "  ${BOLD}${question}${NC} ${DIM}[${default}]${NC}: "
     else
       echo -ne "  ${BOLD}${question}${NC}: "
     fi
-
-    if [[ "$secret" == "secret" ]]; then
-      read -r -s input
-      echo ""
-    else
-      read -r input
-    fi
-
+    if [[ "$secret" == "secret" ]]; then read -r -s input; echo ""; else read -r input; fi
     input="${input:-$default}"
-
-    if [[ -z "$input" ]]; then
-      err "This field is required."
-    else
-      eval "${var_name}='${input}'"
-      return 0
-    fi
+    if [[ -z "$input" ]]; then err "This field is required."; else eval "${var_name}='${input}'"; return 0; fi
   done
 }
 
-# prompt_optional VAR_NAME "Question" "default"
 prompt_optional() {
-  local var_name="$1"
-  local question="$2"
-  local default="${3:-}"
-  local input=""
-
+  local var_name="$1" question="$2" default="${3:-}" input=""
   if [[ -n "$default" ]]; then
     echo -ne "  ${BOLD}${question}${NC} ${DIM}[${default}]${NC} ${DIM}(optional, Enter to skip)${NC}: "
   else
@@ -116,20 +106,11 @@ prompt_optional() {
   eval "${var_name}='${input:-$default}'"
 }
 
-# prompt_choice VAR_NAME "Question" option1 option2 ...
 prompt_choice() {
-  local var_name="$1"
-  local question="$2"
-  shift 2
-  local options=("$@")
-  local choice=""
-  local valid=false
-
+  local var_name="$1" question="$2"; shift 2
+  local options=("$@") choice="" valid=false
   echo -e "  ${BOLD}${question}${NC}"
-  for i in "${!options[@]}"; do
-    echo -e "    ${CYAN}$((i+1))${NC}) ${options[$i]}"
-  done
-
+  for i in "${!options[@]}"; do echo -e "    ${CYAN}$((i+1))${NC}) ${options[$i]}"; done
   while ! $valid; do
     echo -ne "  ${BOLD}Enter choice [1-${#options[@]}]${NC}: "
     read -r choice
@@ -142,20 +123,13 @@ prompt_choice() {
   done
 }
 
-# prompt_yes_no VAR_NAME "Question" "y|n"
 prompt_yes_no() {
-  local var_name="$1"
-  local question="$2"
-  local default="${3:-n}"
-  local input=""
-  local display="y/N"
+  local var_name="$1" question="$2" default="${3:-n}" input="" display="y/N"
   [[ "$default" == "y" ]] && display="Y/n"
-
   while true; do
     echo -ne "  ${BOLD}${question}${NC} ${DIM}[${display}]${NC}: "
     read -r input
-    input="${input:-$default}"
-    input="${input,,}"
+    input="${input:-$default}"; input="${input,,}"
     case "$input" in
       y|yes) eval "${var_name}=true";  return ;;
       n|no)  eval "${var_name}=false"; return ;;
@@ -164,79 +138,43 @@ prompt_yes_no() {
   done
 }
 
-# prompt_ip VAR_NAME "Question" "default"
 prompt_ip() {
-  local var_name="$1"
-  local question="$2"
-  local default="${3:-}"
-  local input=""
-
+  local var_name="$1" question="$2" default="${3:-}" input=""
   while true; do
     prompt_input "$var_name" "$question" "$default"
     eval "input=\${${var_name}}"
-    if validate_ip "$input"; then
-      return 0
-    else
-      err "'${input}' is not a valid IPv4 address."
-    fi
+    if validate_ip "$input"; then return 0; else err "'${input}' is not a valid IPv4 address."; fi
   done
 }
 
-# prompt_ip_optional VAR_NAME "Question" "default"
 prompt_ip_optional() {
-  local var_name="$1"
-  local question="$2"
-  local default="${3:-}"
-  local input=""
-
+  local var_name="$1" question="$2" default="${3:-}" input=""
   while true; do
     prompt_optional "$var_name" "$question" "$default"
     eval "input=\${${var_name}}"
-    if [[ -z "$input" ]]; then
-      return 0
-    elif validate_ip "$input"; then
-      return 0
-    else
-      err "'${input}' is not a valid IPv4 address."
-    fi
+    if [[ -z "$input" ]]; then return 0
+    elif validate_ip "$input"; then return 0
+    else err "'${input}' is not a valid IPv4 address."; fi
   done
 }
 
-# Collect multiple IPs into an array variable name (as string)
 prompt_ip_list() {
-  local var_name="$1"   # will hold a bash-array-syntax string
-  local question="$2"
-  local ips=()
-  local ip=""
-  local more=true
-
+  local var_name="$1" question="$2"
+  local ips=() ip="" more=true index=1
   echo -e "  ${BOLD}${question}${NC}"
   hint "Enter one IP per line. Press Enter on a blank line when done."
   echo ""
-
-  local index=1
   while $more; do
     while true; do
       echo -ne "  ${BOLD}Worker ${index} IP${NC} ${DIM}(blank to finish)${NC}: "
       read -r ip
-      if [[ -z "$ip" ]]; then
-        more=false; break
-      elif validate_ip "$ip"; then
-        ips+=("$ip")
-        ok "Added worker: ${ip}"
-        index=$((index + 1))
-        break
-      else
-        err "'${ip}' is not a valid IPv4 address."
-      fi
+      if [[ -z "$ip" ]]; then more=false; break
+      elif validate_ip "$ip"; then ips+=("$ip"); ok "Added worker: ${ip}"; index=$((index+1)); break
+      else err "'${ip}' is not a valid IPv4 address."; fi
     done
   done
-
-  # Build array string: ("ip1" "ip2" ...)
   local arr_str="("
-  for i in "${ips[@]:-}"; do
-    [[ -n "$i" ]] && arr_str+="\"$i\" "
-  done
+  for i in "${ips[@]:-}"; do [[ -n "$i" ]] && arr_str+="\"$i\" "; done
   arr_str="${arr_str% })"
   eval "${var_name}='${arr_str}'"
 }
@@ -248,71 +186,214 @@ validate_ip() {
   local ip="$1"
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
   IFS='.' read -r -a octets <<< "$ip"
-  for octet in "${octets[@]}"; do
-    (( octet <= 255 )) || return 1
-  done
+  for octet in "${octets[@]}"; do (( octet <= 255 )) || return 1; done
   return 0
 }
 
 validate_cidr() {
   local cidr="$1"
   [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
-  local ip="${cidr%/*}"
-  local prefix="${cidr#*/}"
-  validate_ip "$ip" || return 1
-  (( prefix <= 32 )) || return 1
+  validate_ip "${cidr%/*}" || return 1
+  (( ${cidr#*/} <= 32 )) || return 1
   return 0
 }
 
-validate_semver() {
-  [[ "$1" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]
-}
-
-validate_password_strength() {
-  local pw="$1"
-  [[ ${#pw} -ge 12 ]]           || { err "Password must be at least 12 characters.";         return 1; }
-  [[ "$pw" =~ [A-Z] ]]          || { err "Password must contain at least one uppercase letter."; return 1; }
-  [[ "$pw" =~ [a-z] ]]          || { err "Password must contain at least one lowercase letter."; return 1; }
-  [[ "$pw" =~ [0-9] ]]          || { err "Password must contain at least one digit.";         return 1; }
-  [[ "$pw" =~ [^a-zA-Z0-9] ]]  || { err "Password must contain at least one special character."; return 1; }
-  return 0
-}
-
-validate_abs_path() {
-  [[ "$1" == /* ]] || { err "Path must be absolute (start with /)."; return 1; }
-  return 0
-}
-
-validate_k8s_version() {
-  [[ "$1" =~ ^1\.[2-9][0-9]$ ]] || { err "K8s version must be in format 1.XX (e.g. 1.31)."; return 1; }
-  return 0
-}
-
-validate_helm_version() {
-  validate_semver "$1" || { err "Helm version must be in semver format (e.g. 3.16.2)."; return 1; }
-  return 0
-}
-
+validate_semver()   { [[ "$1" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; }
+validate_abs_path() { [[ "$1" == /* ]] || { err "Path must be absolute (start with /)."; return 1; }; return 0; }
+validate_k8s_version() { [[ "$1" =~ ^1\.[2-9][0-9]$ ]] || { err "K8s version must be in format 1.XX (e.g. 1.31)."; return 1; }; return 0; }
+validate_helm_version() { validate_semver "$1" || { err "Helm version must be semver (e.g. 3.16.2)."; return 1; }; return 0; }
 validate_namespace() {
   [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || {
     err "Namespace must be lowercase alphanumeric with hyphens, no leading/trailing hyphens."
     return 1
-  }
+  }; return 0
+}
+validate_password_strength() {
+  local pw="$1"
+  [[ ${#pw} -ge 12 ]]          || { err "Password must be at least 12 characters.";             return 1; }
+  [[ "$pw" =~ [A-Z] ]]         || { err "Password must contain at least one uppercase letter."; return 1; }
+  [[ "$pw" =~ [a-z] ]]         || { err "Password must contain at least one lowercase letter."; return 1; }
+  [[ "$pw" =~ [0-9] ]]         || { err "Password must contain at least one digit.";            return 1; }
+  [[ "$pw" =~ [^a-zA-Z0-9] ]] || { err "Password must contain at least one special character."; return 1; }
   return 0
+}
+
+validate_nodeport() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 30000 && $1 <= 32767 )) || {
+    err "NodePort must be between 30000 and 32767."
+    return 1
+  }; return 0
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PRE-FLIGHT CHECKS
+# ──────────────────────────────────────────────────────────────────────────────
+run_preflight() {
+  local mode="${1:-full}"   # full | ssh-only | nfs-only | nodeport-only
+  local all_pass=true
+
+  section_header "Pre-flight Checks" "✈"
+
+  # ── 1. Collect all nodes ───────────────────────────────────────────────────
+  local all_nodes=("$CONTROL_PLANE_IP")
+  if [[ "$WORKER_IPS_STR" != "()" && -n "${WORKER_IPS_STR:-}" ]]; then
+    while IFS= read -r -d '"' part; do
+      [[ "$part" =~ ^[0-9] ]] && all_nodes+=("$part")
+    done <<< "$WORKER_IPS_STR"
+  fi
+
+  # ── 2. Ping reachability ──────────────────────────────────────────────────
+  info_msg "Checking node reachability (ping)..."
+  for node in "${all_nodes[@]}"; do
+    if ping -c1 -W2 "$node" &>/dev/null 2>&1; then
+      ok "  ${node} — reachable"
+    else
+      err "  ${node} — NOT reachable (ping failed)"
+      warn_msg "  → Check that the node is powered on and the IP is correct."
+      all_pass=false
+    fi
+  done
+  echo ""
+
+  # ── 3. SSH port open ─────────────────────────────────────────────────────
+  info_msg "Checking SSH port 22..."
+  for node in "${all_nodes[@]}"; do
+    if command -v nc &>/dev/null; then
+      if nc -z -w3 "$node" 22 &>/dev/null 2>&1; then
+        ok "  ${node}:22 — open"
+      else
+        err "  ${node}:22 — port closed or filtered"
+        warn_msg "  → Ensure sshd is running: sudo systemctl start ssh"
+        all_pass=false
+      fi
+    else
+      # fallback: bash /dev/tcp
+      if (echo >/dev/tcp/"$node"/22) &>/dev/null 2>&1; then
+        ok "  ${node}:22 — open"
+      else
+        warn_msg "  ${node}:22 — could not check (nc not available)"
+      fi
+    fi
+  done
+  echo ""
+
+  # ── 4. SSH key authentication ─────────────────────────────────────────────
+  if [[ -f "$SSH_KEY_PATH" ]]; then
+    info_msg "Testing SSH key authentication..."
+    for node in "${all_nodes[@]}"; do
+      if ssh -i "$SSH_KEY_PATH" \
+             -o StrictHostKeyChecking=no \
+             -o BatchMode=yes \
+             -o ConnectTimeout=5 \
+             "${SSH_USER}@${node}" "echo ok" &>/dev/null 2>&1; then
+        ok "  ${SSH_USER}@${node} — SSH key auth works"
+      else
+        warn_msg "  ${SSH_USER}@${node} — SSH key auth not yet available"
+        hint "    This is OK before first install — the wizard will copy the key."
+      fi
+    done
+  else
+    info_msg "SSH key ${SSH_KEY_PATH} not yet generated — will be created during install."
+  fi
+  echo ""
+
+  # ── 5. Local disk space ──────────────────────────────────────────────────
+  info_msg "Checking local disk space..."
+  local free_mb
+  free_mb=$(df -m "$SCRIPT_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+  if [[ -n "$free_mb" ]]; then
+    if (( free_mb >= 500 )); then
+      ok "  Local free space: ${free_mb} MB — sufficient"
+    else
+      warn_msg "  Local free space: ${free_mb} MB — low (recommend >= 500 MB)"
+    fi
+  fi
+  echo ""
+
+  # ── 6. NFS reachability ──────────────────────────────────────────────────
+  if [[ "${INSTALL_NFS:-false}" == "true" && -n "${NFS_SERVER_IP:-}" ]]; then
+    info_msg "Checking NFS server reachability (${NFS_SERVER_IP})..."
+    # Try showmount first, then nc fallback for port 2049
+    if command -v showmount &>/dev/null; then
+      local exports
+      exports=$(showmount -e "$NFS_SERVER_IP" 2>&1)
+      if echo "$exports" | grep -q "${NFS_PATH:-}"; then
+        ok "  NFS export ${NFS_PATH} found on ${NFS_SERVER_IP}"
+      elif echo "$exports" | grep -qE "Export list|/"; then
+        warn_msg "  NFS server responds but ${NFS_PATH} not in export list"
+        warn_msg "  → Exports found: $(echo "$exports" | grep '/' | head -3)"
+      else
+        err "  Cannot reach NFS server ${NFS_SERVER_IP} via showmount"
+        warn_msg "  → Check that nfs-kernel-server is running and ports 2049/111 are open"
+        all_pass=false
+      fi
+    elif command -v nc &>/dev/null; then
+      if nc -z -w3 "$NFS_SERVER_IP" 2049 &>/dev/null 2>&1; then
+        ok "  NFS port 2049 open on ${NFS_SERVER_IP}"
+      else
+        err "  NFS port 2049 closed on ${NFS_SERVER_IP}"
+        all_pass=false
+      fi
+    else
+      warn_msg "  Cannot check NFS (no showmount or nc available) — skipping"
+    fi
+    echo ""
+  fi
+
+  # ── 7. NodePort conflict detection ───────────────────────────────────────
+  info_msg "Checking for NodePort conflicts..."
+  declare -A port_map
+  local conflicts=false
+  _register_port() {
+    local port="$1" name="$2"
+    [[ -z "$port" ]] && return
+    if [[ -n "${port_map[$port]:-}" ]]; then
+      err "  NodePort ${port} is used by both '${port_map[$port]}' and '${name}'"
+      conflicts=true; all_pass=false
+    else
+      port_map[$port]="$name"
+      ok "  Port ${port} → ${name}"
+    fi
+  }
+  [[ "${INSTALL_MONITORING:-false}" == "true" ]] && {
+    _register_port "${GRAFANA_NODEPORT:-32000}"      "Grafana"
+    _register_port "${PROMETHEUS_NODEPORT:-32001}"   "Prometheus"
+    _register_port "${ALERTMANAGER_NODEPORT:-32002}"  "Alertmanager"
+  }
+  [[ "${INSTALL_DASHBOARD:-false}" == "true" ]] && \
+    _register_port "${DASHBOARD_NODEPORT:-32443}"    "Dashboard"
+  [[ "${INSTALL_VLLM:-false}" == "true" ]] && \
+    _register_port "${VLLM_NODEPORT:-32080}"         "vLLM Router"
+  $conflicts || ok "  No NodePort conflicts detected"
+  echo ""
+
+  # ── Result ────────────────────────────────────────────────────────────────
+  if $all_pass; then
+    ok "All pre-flight checks passed."
+  else
+    warn_msg "Some pre-flight checks failed — review the warnings above."
+    if [[ "$mode" == "full" ]]; then
+      echo ""
+      prompt_yes_no _PF_CONTINUE "Continue anyway?" "y"
+      [[ "${_PF_CONTINUE}" != "true" ]] && { echo ""; warn_msg "Aborted."; exit 1; }
+    fi
+  fi
+  echo ""
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SECTION 1 — SSH & Node Access
 # ──────────────────────────────────────────────────────────────────────────────
 collect_ssh() {
-  section_header "SSH & Node Access" "1/8"
+  section_header "SSH & Node Access" "1/10"
   hint "These credentials are used to connect to all cluster nodes."
   echo ""
 
   prompt_input SSH_USER "Remote username" "ubuntu"
   ok "SSH user: ${SSH_USER}"
 
-  prompt_input SSH_KEY_PATH "SSH private key path (will be generated if missing)" \
+  prompt_input SSH_KEY_PATH \
+    "SSH private key path (will be generated if missing)" \
     "${HOME}/.ssh/k8s_cluster_rsa"
   ok "Key path: ${SSH_KEY_PATH}"
 
@@ -323,8 +404,8 @@ collect_ssh() {
 # SECTION 2 — Cluster Nodes
 # ──────────────────────────────────────────────────────────────────────────────
 collect_nodes() {
-  section_header "Cluster Node IPs" "2/8"
-  hint "Enter the IP addresses for your control plane and worker nodes."
+  section_header "Cluster Node IPs" "2/10"
+  hint "Enter IP addresses for your control plane and worker nodes."
   hint "All nodes must be running Ubuntu 24.04 and reachable via SSH."
   echo ""
 
@@ -335,7 +416,6 @@ collect_nodes() {
   prompt_ip_list WORKER_IPS_STR "Worker node IPs"
   echo ""
 
-  # Parse count for display
   local count=0
   if [[ "$WORKER_IPS_STR" != "()" ]]; then
     count=$(echo "$WORKER_IPS_STR" | grep -o '"' | wc -l)
@@ -346,6 +426,7 @@ collect_nodes() {
   else
     ok "${count} worker node(s) registered."
   fi
+  WORKER_COUNT=$count
 
   show_progress
 }
@@ -354,24 +435,25 @@ collect_nodes() {
 # SECTION 3 — Kubernetes Settings
 # ──────────────────────────────────────────────────────────────────────────────
 collect_k8s() {
-  section_header "Kubernetes Settings" "3/8"
+  section_header "Kubernetes Settings" "3/10"
   echo ""
 
-  # K8s version
   while true; do
     prompt_input K8S_VERSION "Kubernetes version (minor)" "1.31"
     validate_k8s_version "$K8S_VERSION" && ok "K8s version: ${K8S_VERSION}" && break
   done
   echo ""
 
-  # CNI
   prompt_choice CNI_PLUGIN "Container Network Interface (CNI) plugin" \
-    "flannel" "calico"
+    "flannel (recommended — VXLAN, works on VMs and bare metal)" \
+    "calico (advanced — NetworkPolicy support, VXLAN mode)"
+  CNI_PLUGIN="${CNI_PLUGIN%% *}"
+  ok "CNI: ${CNI_PLUGIN}"
   echo ""
 
-  # Pod CIDR — auto-default by CNI
   local default_cidr="10.244.0.0/16"
   [[ "$CNI_PLUGIN" == "calico" ]] && default_cidr="192.168.0.0/16"
+  hint "Default CIDR auto-selected for ${CNI_PLUGIN}: ${default_cidr}"
 
   while true; do
     prompt_input POD_CIDR "Pod network CIDR" "$default_cidr"
@@ -380,7 +462,6 @@ collect_k8s() {
   done
   echo ""
 
-  # Helm version
   while true; do
     prompt_input HELM_VERSION "Helm version" "3.16.2"
     validate_helm_version "$HELM_VERSION" && ok "Helm: ${HELM_VERSION}" && break
@@ -393,7 +474,7 @@ collect_k8s() {
 # SECTION 4 — NVIDIA Drivers
 # ──────────────────────────────────────────────────────────────────────────────
 collect_nvidia() {
-  section_header "NVIDIA Drivers" "4/8"
+  section_header "NVIDIA Drivers" "4/10"
   hint "The installer auto-detects GPUs via lspci and skips non-GPU nodes."
   echo ""
 
@@ -401,8 +482,6 @@ collect_nvidia() {
   echo ""
 
   if [[ "$INSTALL_NVIDIA" == "true" ]]; then
-
-    # ── Driver Branch ─────────────────────────────────────────────────────────
     echo -e "  ${BOLD}${BLUE}  Driver Branch Reference:${NC}"
     echo -e "  ${DIM}  590  │ LATEST   │ RTX 50xx, GB200/B200/B100 (Blackwell), H200${NC}"
     echo -e "  ${DIM}  580  │ Latest-1 │ RTX 50xx, Blackwell, H200 — previous latest${NC}"
@@ -424,47 +503,37 @@ collect_nvidia() {
       "550 (LTS — Ampere/Hopper/Lovelace — recommended for older HW)" \
       "535 (LTS — Ampere DataCenter A100/A30/A10)" \
       "525 (Legacy LTS — older Ampere)"
-
-    # Strip the description, keep only the version number
     NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION%% *}"
     ok "NVIDIA driver branch: ${NVIDIA_DRIVER_VERSION}"
     echo ""
 
-    # ── Open Kernel Modules ───────────────────────────────────────────────────
     echo -e "  ${BOLD}${BLUE}  Open Kernel Modules:${NC}"
     echo -e "  ${DIM}  Recommended for Turing (RTX 20xx) and newer GPUs.${NC}"
-    echo -e "  ${DIM}  REQUIRED for Blackwell (B-series). Adds better driver stability${NC}"
-    echo -e "  ${DIM}  and faster feature adoption. Installs nvidia-driver-*-open package.${NC}"
+    echo -e "  ${DIM}  REQUIRED for Blackwell (B-series).${NC}"
     echo ""
-
-  # Auto-suggest open kernel for 590/570 (Blackwell requires it)
     local default_open="n"
-    if [[ "$NVIDIA_DRIVER_VERSION" == "590" || "$NVIDIA_DRIVER_VERSION" == "580" || "$NVIDIA_DRIVER_VERSION" == "570" ]]; then
+    if [[ "$NVIDIA_DRIVER_VERSION" =~ ^(590|580|570)$ ]]; then
       default_open="y"
       hint "Branch ${NVIDIA_DRIVER_VERSION} targets Blackwell/RTX 50xx — open kernel modules are strongly recommended."
     fi
-
-    prompt_yes_no NVIDIA_OPEN_KERNEL "Use open kernel modules (nvidia-driver-${NVIDIA_DRIVER_VERSION}-open)?" "$default_open"
+    prompt_yes_no NVIDIA_OPEN_KERNEL \
+      "Use open kernel modules (nvidia-driver-${NVIDIA_DRIVER_VERSION}-open)?" "$default_open"
     if [[ "$NVIDIA_OPEN_KERNEL" == "true" ]]; then
-      ok "Open kernel modules: enabled (nvidia-driver-${NVIDIA_DRIVER_VERSION}-open)"
+      ok "Open kernel modules: enabled"
     else
-      ok "Open kernel modules: disabled (nvidia-driver-${NVIDIA_DRIVER_VERSION} proprietary)"
+      ok "Open kernel modules: disabled (proprietary)"
     fi
     echo ""
 
-    # ── Fabric Manager ────────────────────────────────────────────────────────
     echo -e "  ${BOLD}${BLUE}  Fabric Manager:${NC}"
-    echo -e "  ${DIM}  Required for NVLink / NVSwitch multi-GPU systems${NC}"
-    echo -e "  ${DIM}  (A100 SXM4, H100 SXM5, H200 SXM, DGX, HGX platforms).${NC}"
-    echo -e "  ${DIM}  Not needed for PCIe single-GPU nodes.${NC}"
+    echo -e "  ${DIM}  Required for NVLink/NVSwitch multi-GPU systems (A100 SXM4, H100 SXM5, DGX, HGX).${NC}"
+    echo -e "  ${DIM}  Not needed for single PCIe GPU nodes.${NC}"
     echo ""
-
     prompt_choice NVIDIA_FABRIC_MANAGER \
       "Fabric Manager installation" \
-      "auto (detect NVSwitch/SXM at install time)" \
+      "auto (detect NVSwitch/SXM at install time — recommended)" \
       "yes (always install)" \
       "no (never install)"
-
     case "$NVIDIA_FABRIC_MANAGER" in
       auto*) NVIDIA_FABRIC_MANAGER="auto" ;;
       yes*)  NVIDIA_FABRIC_MANAGER="true" ;;
@@ -473,11 +542,9 @@ collect_nvidia() {
     ok "Fabric Manager: ${NVIDIA_FABRIC_MANAGER}"
     echo ""
 
-    # ── Reboot timeout ────────────────────────────────────────────────────────
     echo -e "  ${BOLD}${BLUE}  Reboot Timeout:${NC}"
-    echo -e "  ${DIM}  After the driver installs, each node reboots automatically.${NC}"
-    echo -e "  ${DIM}  This is the maximum seconds to wait per node for SSH to return.${NC}"
-    echo -e "  ${DIM}  Slow hardware or large initramfs may need 300-600s.${NC}"
+    echo -e "  ${DIM}  After the driver installs, each node reboots. This is the max seconds${NC}"
+    echo -e "  ${DIM}  to wait per node for SSH to return. Slow hardware may need 600s.${NC}"
     echo ""
     while true; do
       prompt_input NVIDIA_REBOOT_TIMEOUT "Seconds to wait per node after reboot" "300"
@@ -501,7 +568,7 @@ collect_nvidia() {
 # SECTION 5 — Monitoring (Prometheus + Grafana)
 # ──────────────────────────────────────────────────────────────────────────────
 collect_monitoring() {
-  section_header "Monitoring Stack — Prometheus & Grafana" "5/8"
+  section_header "Monitoring Stack — Prometheus & Grafana" "5/10"
   hint "Deploys kube-prometheus-stack via Helm."
   echo ""
 
@@ -509,32 +576,38 @@ collect_monitoring() {
   echo ""
 
   if [[ "$INSTALL_MONITORING" == "true" ]]; then
-    # Chart version
     prompt_input PROM_STACK_VERSION "kube-prometheus-stack chart version" "65.1.0"
     ok "Chart version: ${PROM_STACK_VERSION}"
     echo ""
 
-    # Namespace
     while true; do
       prompt_input NS_MONITORING "Monitoring namespace" "monitoring"
       validate_namespace "$NS_MONITORING" && ok "Namespace: ${NS_MONITORING}" && break
     done
     echo ""
 
-    # NodePort assignments
     hint "NodePort services will be exposed on the control plane IP."
-    prompt_input GRAFANA_NODEPORT     "Grafana NodePort"      "32000"
-    prompt_input PROMETHEUS_NODEPORT  "Prometheus NodePort"   "32001"
-    prompt_input ALERTMANAGER_NODEPORT "Alertmanager NodePort" "32002"
+    hint "NodePorts must be in the range 30000–32767 and must be unique."
+    echo ""
+    while true; do
+      prompt_input GRAFANA_NODEPORT "Grafana NodePort" "32000"
+      validate_nodeport "$GRAFANA_NODEPORT" && ok "Grafana: :${GRAFANA_NODEPORT}" && break
+    done
+    while true; do
+      prompt_input PROMETHEUS_NODEPORT "Prometheus NodePort" "32001"
+      validate_nodeport "$PROMETHEUS_NODEPORT" && ok "Prometheus: :${PROMETHEUS_NODEPORT}" && break
+    done
+    while true; do
+      prompt_input ALERTMANAGER_NODEPORT "Alertmanager NodePort" "32002"
+      validate_nodeport "$ALERTMANAGER_NODEPORT" && ok "Alertmanager: :${ALERTMANAGER_NODEPORT}" && break
+    done
     echo ""
 
-    # Grafana admin password — with strength check & confirm
     local pw1="" pw2=""
     while true; do
       echo -ne "  ${BOLD}Grafana admin password${NC}: "
       read -r -s pw1; echo ""
       validate_password_strength "$pw1" || continue
-
       echo -ne "  ${BOLD}Confirm password${NC}: "
       read -r -s pw2; echo ""
       if [[ "$pw1" == "$pw2" ]]; then
@@ -547,11 +620,8 @@ collect_monitoring() {
     done
     echo ""
 
-    # Prometheus retention
     prompt_input PROM_RETENTION "Prometheus data retention" "30d"
     ok "Retention: ${PROM_RETENTION}"
-
-    # Prometheus storage
     prompt_input PROM_STORAGE_SIZE "Prometheus PVC size" "20Gi"
     ok "Storage: ${PROM_STORAGE_SIZE}"
 
@@ -574,7 +644,7 @@ collect_monitoring() {
 # SECTION 6 — NFS External Provisioner
 # ──────────────────────────────────────────────────────────────────────────────
 collect_nfs() {
-  section_header "NFS Storage Provisioner" "6/8"
+  section_header "NFS Storage Provisioner" "6/10"
   hint "Sets up dynamic PVC provisioning via an NFS server."
   echo ""
 
@@ -582,7 +652,7 @@ collect_nfs() {
   echo ""
 
   if [[ "$INSTALL_NFS" == "true" ]]; then
-    prompt_ip_optional NFS_SERVER_IP "NFS server IP" "$CONTROL_PLANE_IP"
+    prompt_ip_optional NFS_SERVER_IP "NFS server IP" "${CONTROL_PLANE_IP:-}"
     ok "NFS server: ${NFS_SERVER_IP:-<none>}"
     echo ""
 
@@ -592,7 +662,6 @@ collect_nfs() {
     done
     echo ""
 
-    # Namespace
     while true; do
       prompt_input NS_NFS "NFS provisioner namespace" "nfs-provisioner"
       validate_namespace "$NS_NFS" && ok "Namespace: ${NS_NFS}" && break
@@ -601,7 +670,6 @@ collect_nfs() {
 
     prompt_input NFS_STORAGE_CLASS "StorageClass name" "nfs-client"
     ok "StorageClass: ${NFS_STORAGE_CLASS}"
-
     prompt_yes_no NFS_DEFAULT_SC "Make this the default StorageClass?" "y"
     ok "Default SC: ${NFS_DEFAULT_SC}"
 
@@ -622,7 +690,7 @@ collect_nfs() {
 # ──────────────────────────────────────────────────────────────────────────────
 collect_dashboard() {
   section_header "Kubernetes Dashboard" "7/10"
-  hint "Deploys the official Kubernetes Dashboard v2.7.0 with a NodePort service."
+  hint "Deploys the official Kubernetes Dashboard with a NodePort HTTPS service."
   hint "Access via https://<control-plane>:<nodeport> using a generated admin token."
   echo ""
 
@@ -631,16 +699,11 @@ collect_dashboard() {
 
   if [[ "$INSTALL_DASHBOARD" == "true" ]]; then
     DASHBOARD_VERSION="2.7.0"
-
     while true; do
       prompt_input DASHBOARD_NODEPORT "Dashboard NodePort (HTTPS)" "32443"
-      [[ "$DASHBOARD_NODEPORT" =~ ^[0-9]+$ ]] \
-        && (( DASHBOARD_NODEPORT >= 30000 && DASHBOARD_NODEPORT <= 32767 )) \
-        && ok "Dashboard NodePort: ${DASHBOARD_NODEPORT}" && break
-      err "NodePort must be between 30000 and 32767."
+      validate_nodeport "$DASHBOARD_NODEPORT" && ok "Dashboard NodePort: ${DASHBOARD_NODEPORT}" && break
     done
     echo ""
-
     while true; do
       prompt_input NS_DASHBOARD "Dashboard namespace" "kubernetes-dashboard"
       validate_namespace "$NS_DASHBOARD" && ok "Namespace: ${NS_DASHBOARD}" && break
@@ -664,53 +727,29 @@ collect_vllm() {
   hint "Requires NVIDIA GPU Operator to be enabled."
   echo ""
 
+  _vllm_defaults() {
+    VLLM_NAMESPACE="vllm"; VLLM_NODEPORT="32080"
+    VLLM_MODEL="meta-llama/Llama-3.2-1B-Instruct"; VLLM_HF_TOKEN=""
+    VLLM_DTYPE="auto"; VLLM_MAX_MODEL_LEN="4096"; VLLM_GPU_COUNT="1"
+    VLLM_CPU_REQUEST="4"; VLLM_CPU_LIMIT="8"
+    VLLM_MEM_REQUEST="16Gi"; VLLM_MEM_LIMIT="32Gi"
+    VLLM_EXTRA_ARGS=""; VLLM_STORAGE_SIZE="50Gi"
+    VLLM_REUSE_PVC="false"; VLLM_PVC_NAME="vllm-model-cache"
+  }
+
   if [[ "$INSTALL_NVIDIA" != "true" ]]; then
     warn_msg "NVIDIA is disabled — vLLM requires GPU support and will be skipped."
-    INSTALL_VLLM="false"
-    VLLM_NAMESPACE="vllm"
-    VLLM_NODEPORT="32080"
-    VLLM_MODEL="meta-llama/Llama-3.2-1B-Instruct"
-    VLLM_HF_TOKEN=""
-    VLLM_DTYPE="auto"
-    VLLM_MAX_MODEL_LEN="4096"
-    VLLM_GPU_COUNT="1"
-    VLLM_CPU_REQUEST="4"
-    VLLM_CPU_LIMIT="8"
-    VLLM_MEM_REQUEST="16Gi"
-    VLLM_MEM_LIMIT="32Gi"
-    VLLM_EXTRA_ARGS=""
-    VLLM_STORAGE_SIZE="50Gi"
-    VLLM_REUSE_PVC="false"
-    VLLM_PVC_NAME="vllm-model-cache"
-    show_progress
-    return
+    INSTALL_VLLM="false"; _vllm_defaults; show_progress; return
   fi
 
   prompt_yes_no INSTALL_VLLM "Install vLLM production stack?" "n"
   echo ""
 
   if [[ "$INSTALL_VLLM" != "true" ]]; then
-    VLLM_NAMESPACE="vllm"
-    VLLM_NODEPORT="32080"
-    VLLM_MODEL="meta-llama/Llama-3.2-1B-Instruct"
-    VLLM_HF_TOKEN=""
-    VLLM_DTYPE="auto"
-    VLLM_MAX_MODEL_LEN="4096"
-    VLLM_GPU_COUNT="1"
-    VLLM_CPU_REQUEST="4"
-    VLLM_CPU_LIMIT="8"
-    VLLM_MEM_REQUEST="16Gi"
-    VLLM_MEM_LIMIT="32Gi"
-    VLLM_EXTRA_ARGS=""
-    VLLM_STORAGE_SIZE="50Gi"
-    VLLM_REUSE_PVC="false"
-    VLLM_PVC_NAME="vllm-model-cache"
-    warn_msg "vLLM stack will be skipped."
-    show_progress
-    return
+    _vllm_defaults; warn_msg "vLLM stack will be skipped."; show_progress; return
   fi
 
-  # ── Namespace & NodePort ───────────────────────────────────────────────────
+  # Namespace & NodePort
   while true; do
     prompt_input VLLM_NAMESPACE "vLLM namespace" "vllm"
     validate_namespace "$VLLM_NAMESPACE" && ok "Namespace: ${VLLM_NAMESPACE}" && break
@@ -719,48 +758,60 @@ collect_vllm() {
 
   while true; do
     prompt_input VLLM_NODEPORT "vLLM router NodePort" "32080"
-    [[ "$VLLM_NODEPORT" =~ ^[0-9]+$ ]] \
-      && (( VLLM_NODEPORT >= 30000 && VLLM_NODEPORT <= 32767 )) \
-      && ok "vLLM NodePort: ${VLLM_NODEPORT}" && break
-    err "NodePort must be between 30000 and 32767."
+    validate_nodeport "$VLLM_NODEPORT" && ok "vLLM NodePort: ${VLLM_NODEPORT}" && break
   done
   echo ""
 
-  # ── Model selection ────────────────────────────────────────────────────────
-  echo -e "  ${BOLD}${BLUE}  Model${NC}"
-  hint "Enter a HuggingFace model ID (e.g. meta-llama/Llama-3.2-1B-Instruct,"
-  hint "  mistralai/Mistral-7B-Instruct-v0.3, Qwen/Qwen2.5-7B-Instruct)."
-  hint "  The model will be downloaded on first pod startup."
+  # Model selection with common suggestions
+  echo -e "  ${BOLD}${BLUE}  Model Selection${NC}"
+  echo -e "  ${DIM}  Common models (Enter to use, or type any HuggingFace model ID):${NC}"
+  echo -e "  ${DIM}    1) meta-llama/Llama-3.2-1B-Instruct   (1B  — ~2 GB VRAM, fast)${NC}"
+  echo -e "  ${DIM}    2) meta-llama/Llama-3.2-3B-Instruct   (3B  — ~6 GB VRAM)${NC}"
+  echo -e "  ${DIM}    3) meta-llama/Llama-3.1-8B-Instruct   (8B  — ~16 GB VRAM)${NC}"
+  echo -e "  ${DIM}    4) Qwen/Qwen2.5-7B-Instruct           (7B  — ~14 GB VRAM, public)${NC}"
+  echo -e "  ${DIM}    5) mistralai/Mistral-7B-Instruct-v0.3 (7B  — ~14 GB VRAM)${NC}"
+  echo -e "  ${DIM}    6) Custom model ID${NC}"
   echo ""
-  prompt_input VLLM_MODEL "HuggingFace model ID" "meta-llama/Llama-3.2-1B-Instruct"
+  local model_choice=""
+  echo -ne "  ${BOLD}Model [1-6 or HF model ID]${NC} ${DIM}[1]${NC}: "
+  read -r model_choice
+  case "${model_choice:-1}" in
+    1|"") VLLM_MODEL="meta-llama/Llama-3.2-1B-Instruct" ;;
+    2)    VLLM_MODEL="meta-llama/Llama-3.2-3B-Instruct" ;;
+    3)    VLLM_MODEL="meta-llama/Llama-3.1-8B-Instruct" ;;
+    4)    VLLM_MODEL="Qwen/Qwen2.5-7B-Instruct" ;;
+    5)    VLLM_MODEL="mistralai/Mistral-7B-Instruct-v0.3" ;;
+    6)    prompt_input VLLM_MODEL "HuggingFace model ID" "meta-llama/Llama-3.2-1B-Instruct" ;;
+    *)    VLLM_MODEL="$model_choice" ;;  # user typed a model ID directly
+  esac
   ok "Model: ${VLLM_MODEL}"
   echo ""
 
-  # ── HuggingFace token ──────────────────────────────────────────────────────
+  # HuggingFace token
   echo -e "  ${BOLD}${BLUE}  HuggingFace Token${NC}"
-  hint "Required for gated models (Llama, Gemma, Mistral, etc.)."
-  hint "Leave blank if the model is public."
+  hint "Required for gated models (Llama, Gemma, Mistral, etc.). Leave blank for public models."
+  # Detect if model is likely gated
+  if echo "$VLLM_MODEL" | grep -qiE "llama|gemma|mistral|falcon"; then
+    hint "⚠  '${VLLM_MODEL}' is typically a gated model — a HF token is likely required."
+  fi
   echo ""
-  local hf_input=""
   echo -ne "  ${BOLD}HuggingFace token${NC} ${DIM}(Enter to skip)${NC}: "
-  read -r -s hf_input
-  echo ""
+  local hf_input=""; read -r -s hf_input; echo ""
   VLLM_HF_TOKEN="${hf_input}"
   if [[ -n "$VLLM_HF_TOKEN" ]]; then
     ok "HuggingFace token: set (hidden)"
   else
-    warn_msg "No HF token provided — will fail for gated models."
+    warn_msg "No HF token — will fail for gated models."
   fi
   echo ""
 
-  # ── Engine parameters ──────────────────────────────────────────────────────
+  # Engine parameters
   echo -e "  ${BOLD}${BLUE}  Engine Parameters${NC}"
-
   prompt_choice VLLM_DTYPE \
     "Tensor dtype" \
     "auto (recommended — picks optimal dtype per GPU)" \
-    "float16 (FP16 — good for Ampere/Turing GPUs)" \
-    "bfloat16 (BF16 — better for Hopper/Ada/Blackwell)" \
+    "float16 (FP16 — Ampere/Turing)" \
+    "bfloat16 (BF16 — Hopper/Ada/Blackwell)" \
     "float32 (FP32 — high precision, slow)"
   case "$VLLM_DTYPE" in
     auto*)    VLLM_DTYPE="auto" ;;
@@ -771,56 +822,75 @@ collect_vllm() {
   ok "dtype: ${VLLM_DTYPE}"
   echo ""
 
-  prompt_input VLLM_MAX_MODEL_LEN \
-    "Max model context length (tokens)" "4096"
+  prompt_input VLLM_MAX_MODEL_LEN "Max model context length (tokens)" "4096"
   ok "Max context length: ${VLLM_MAX_MODEL_LEN} tokens"
   echo ""
 
+  # GPU count — auto-suggest based on worker count
+  local suggested_gpus="1"
+  if (( ${WORKER_COUNT:-0} >= 2 )); then suggested_gpus="${WORKER_COUNT}"; fi
+  hint "Allocate multiple GPUs to enable tensor parallelism across GPUs."
   while true; do
-    prompt_input VLLM_GPU_COUNT "Number of GPUs per replica" "1"
-    [[ "$VLLM_GPU_COUNT" =~ ^[1-9][0-9]*$ ]] \
-      && ok "GPUs per replica: ${VLLM_GPU_COUNT}" && break
+    prompt_input VLLM_GPU_COUNT "Number of GPUs per replica" "$suggested_gpus"
+    [[ "$VLLM_GPU_COUNT" =~ ^[1-9][0-9]*$ ]] && ok "GPUs per replica: ${VLLM_GPU_COUNT}" && break
     err "Must be a positive integer."
   done
   echo ""
 
-  # ── Resource limits ────────────────────────────────────────────────────────
+  # Resource limits — auto-scale suggestion based on GPU count
+  local suggested_mem_req="16Gi" suggested_mem_lim="32Gi"
+  local suggested_cpu_req="4" suggested_cpu_lim="8"
+  if (( VLLM_GPU_COUNT >= 4 )); then
+    suggested_mem_req="64Gi"; suggested_mem_lim="128Gi"
+    suggested_cpu_req="16"; suggested_cpu_lim="32"
+    hint "Scaling resource suggestions for ${VLLM_GPU_COUNT} GPUs."
+  elif (( VLLM_GPU_COUNT >= 2 )); then
+    suggested_mem_req="32Gi"; suggested_mem_lim="64Gi"
+    suggested_cpu_req="8"; suggested_cpu_lim="16"
+    hint "Scaling resource suggestions for ${VLLM_GPU_COUNT} GPUs."
+  fi
+
   echo -e "  ${BOLD}${BLUE}  Resource Limits${NC}"
   hint "CPU and memory per vLLM replica pod."
   echo ""
-  prompt_input VLLM_CPU_REQUEST  "CPU request (cores)"   "4"
-  prompt_input VLLM_CPU_LIMIT    "CPU limit (cores)"     "8"
-  prompt_input VLLM_MEM_REQUEST  "Memory request"        "16Gi"
-  prompt_input VLLM_MEM_LIMIT    "Memory limit"          "32Gi"
-  ok "Resources: CPU ${VLLM_CPU_REQUEST}-${VLLM_CPU_LIMIT} cores | Mem ${VLLM_MEM_REQUEST}-${VLLM_MEM_LIMIT}"
-  echo ""
+  prompt_input VLLM_CPU_REQUEST "CPU request (cores)" "$suggested_cpu_req"
+  prompt_input VLLM_CPU_LIMIT   "CPU limit (cores)"   "$suggested_cpu_lim"
+  prompt_input VLLM_MEM_REQUEST "Memory request"      "$suggested_mem_req"
+  prompt_input VLLM_MEM_LIMIT   "Memory limit"        "$suggested_mem_lim"
+  ok "Resources: CPU ${VLLM_CPU_REQUEST}–${VLLM_CPU_LIMIT} | Mem ${VLLM_MEM_REQUEST}–${VLLM_MEM_LIMIT}"
 
-  # ── Extra vLLM args ────────────────────────────────────────────────────────
-  echo -e "  ${BOLD}${BLUE}  Extra vLLM Arguments${NC}"
-  hint "Additional vLLM engine flags passed verbatim (e.g. --enable-chunked-prefill"
-  hint "  --max-num-seqs 256 --quantization awq). Leave blank for defaults."
-  echo ""
-  prompt_optional VLLM_EXTRA_ARGS "Extra vLLM args" ""
-  if [[ -n "$VLLM_EXTRA_ARGS" ]]; then
-    ok "Extra args: ${VLLM_EXTRA_ARGS}"
-  else
-    ok "No extra args."
+  # Memory adequacy warning
+  local mem_req_gi
+  mem_req_gi=$(echo "$VLLM_MEM_REQUEST" | grep -oE '[0-9]+')
+  if echo "$VLLM_MODEL" | grep -qiE "70b|65b|34b" && (( ${mem_req_gi:-0} < 80 )); then
+    warn_msg "Large model detected (likely 34–70B params). Memory request of ${VLLM_MEM_REQUEST} may be insufficient."
+    hint "Recommend >= 80Gi for 34B, >= 140Gi for 70B models."
+  elif echo "$VLLM_MODEL" | grep -qiE "13b|14b" && (( ${mem_req_gi:-0} < 28 )); then
+    warn_msg "13–14B model detected. Memory request of ${VLLM_MEM_REQUEST} may be insufficient."
+    hint "Recommend >= 28Gi for 13–14B models."
   fi
   echo ""
 
-  # ── Model cache storage ────────────────────────────────────────────────────
-  echo -e "  ${BOLD}${BLUE}  Model Cache Storage${NC}"
-  hint "Models are cached on a PersistentVolume so they survive pod restarts."
-  hint "The cluster's default StorageClass will be used (NFS if configured)."
+  # Extra vLLM args
+  echo -e "  ${BOLD}${BLUE}  Extra vLLM Arguments${NC}"
+  hint "Additional engine flags (e.g. --enable-chunked-prefill --quantization awq)."
+  hint "Leave blank for defaults."
+  echo ""
+  prompt_optional VLLM_EXTRA_ARGS "Extra vLLM args" ""
+  if [[ -n "$VLLM_EXTRA_ARGS" ]]; then ok "Extra args: ${VLLM_EXTRA_ARGS}"
+  else ok "No extra args."; fi
   echo ""
 
+  # Model cache storage
+  echo -e "  ${BOLD}${BLUE}  Model Cache Storage${NC}"
+  hint "Models are cached on a PVC so they survive pod restarts without re-downloading."
+  echo ""
   prompt_yes_no VLLM_REUSE_PVC "Reuse an existing PVC for model cache?" "n"
   echo ""
-
   if [[ "$VLLM_REUSE_PVC" == "true" ]]; then
     prompt_input VLLM_PVC_NAME "Existing PVC name" "vllm-model-cache"
     ok "Will reuse PVC: ${VLLM_PVC_NAME}"
-    VLLM_STORAGE_SIZE=""   # size irrelevant when reusing
+    VLLM_STORAGE_SIZE=""
   else
     prompt_input VLLM_PVC_NAME "PVC name to create" "vllm-model-cache"
     prompt_input VLLM_STORAGE_SIZE "Storage size for model cache" "50Gi"
@@ -832,7 +902,7 @@ collect_vllm() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SECTION 9 — Kubernetes Namespaces
+# SECTION 9 — Namespaces
 # ──────────────────────────────────────────────────────────────────────────────
 collect_namespaces() {
   section_header "Kubernetes Namespaces" "9/10"
@@ -852,35 +922,22 @@ collect_namespaces() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SECTION 8 — Feature Flags Summary & Confirm
+# SECTION 10 — Summary & Inline Edit
 # ──────────────────────────────────────────────────────────────────────────────
-confirm_summary() {
-  section_header "Configuration Summary — Review Before Continuing" "10/10"
-
-  # Parse worker count
+print_summary() {
   local worker_count=0
-  if [[ "$WORKER_IPS_STR" != "()" && -n "$WORKER_IPS_STR" ]]; then
+  if [[ "$WORKER_IPS_STR" != "()" && -n "${WORKER_IPS_STR:-}" ]]; then
     worker_count=$(echo "$WORKER_IPS_STR" | grep -o '"' | wc -l)
     worker_count=$((worker_count / 2))
   fi
-  local worker_list=""
-  if (( worker_count > 0 )); then
-    worker_list=$(echo "$WORKER_IPS_STR" | tr -d '()"' | xargs)
-  else
-    worker_list="none (single-node)"
-  fi
+  local worker_list="none (single-node)"
+  (( worker_count > 0 )) && worker_list=$(echo "$WORKER_IPS_STR" | tr -d '()"' | xargs)
 
-  # Feature on/off indicators
-  nvidia_status="${RED}✖ Skip${NC}";  [[ "$INSTALL_NVIDIA" == "true" ]] && nvidia_status="${GREEN}✔ driver-${NVIDIA_DRIVER_VERSION}${NC}"
-  local nvidia_detail=""
-  if [[ "$INSTALL_NVIDIA" == "true" ]]; then
-    [[ "$NVIDIA_OPEN_KERNEL" == "true" ]] && nvidia_detail=" open-kernel" || nvidia_detail=" proprietary"
-    nvidia_detail+=" | fabric-mgr: ${NVIDIA_FABRIC_MANAGER} | reboot-timeout: ${NVIDIA_REBOOT_TIMEOUT}s"
-  fi
-  mon_status="${RED}✖ Skip${NC}";    [[ "$INSTALL_MONITORING" == "true" ]] && mon_status="${GREEN}✔ v${PROM_STACK_VERSION}${NC}"
-  nfs_status="${RED}✖ Skip${NC}";    [[ "$INSTALL_NFS" == "true" ]] && nfs_status="${GREEN}✔ ${NFS_SERVER_IP}:${NFS_PATH}${NC}"
-  dash_status="${RED}✖ Skip${NC}";   [[ "$INSTALL_DASHBOARD" == "true" ]] && dash_status="${GREEN}✔ v${DASHBOARD_VERSION}${NC}"
-  vllm_status="${RED}✖ Skip${NC}";   [[ "$INSTALL_VLLM" == "true" ]] && vllm_status="${GREEN}✔ ${VLLM_NAMESPACE}${NC}"
+  local nvidia_status="${RED}✖ Skip${NC}"; [[ "$INSTALL_NVIDIA" == "true" ]] && nvidia_status="${GREEN}✔ driver-${NVIDIA_DRIVER_VERSION}${NC}"
+  local mon_status="${RED}✖ Skip${NC}";    [[ "$INSTALL_MONITORING" == "true" ]] && mon_status="${GREEN}✔ v${PROM_STACK_VERSION}${NC}"
+  local nfs_status="${RED}✖ Skip${NC}";    [[ "$INSTALL_NFS" == "true" ]] && nfs_status="${GREEN}✔ ${NFS_SERVER_IP}:${NFS_PATH}${NC}"
+  local dash_status="${RED}✖ Skip${NC}";   [[ "$INSTALL_DASHBOARD" == "true" ]] && dash_status="${GREEN}✔ v${DASHBOARD_VERSION}${NC}"
+  local vllm_status="${RED}✖ Skip${NC}";   [[ "$INSTALL_VLLM" == "true" ]] && vllm_status="${GREEN}✔ ${VLLM_NAMESPACE}${NC}"
 
   echo -e "  ${BOLD}${BLUE}── Nodes ─────────────────────────────────────────────────${NC}"
   echo -e "  Control plane  : ${CYAN}${CONTROL_PLANE_IP}${NC}"
@@ -895,72 +952,105 @@ confirm_summary() {
   echo -e "  Helm           : ${CYAN}${HELM_VERSION}${NC}"
   echo ""
   echo -e "  ${BOLD}${BLUE}── Components ────────────────────────────────────────────${NC}"
-  echo -e "  NVIDIA drivers : $(echo -e ${nvidia_status})${DIM}${nvidia_detail}${NC}"
+  echo -e "  NVIDIA drivers : $(echo -e "${nvidia_status}")"
+  if [[ "$INSTALL_NVIDIA" == "true" ]]; then
+    echo -e "    kernel       : ${DIM}$([[ "$NVIDIA_OPEN_KERNEL" == "true" ]] && echo open || echo proprietary) | FM: ${NVIDIA_FABRIC_MANAGER} | reboot: ${NVIDIA_REBOOT_TIMEOUT}s${NC}"
+  fi
   if [[ "$INSTALL_MONITORING" == "true" ]]; then
-    echo -e "  Monitoring     : $(echo -e ${mon_status})  (ns: ${NS_MONITORING})"
+    echo -e "  Monitoring     : $(echo -e "${mon_status}")  (ns: ${NS_MONITORING})"
     echo -e "    Grafana      : ${CYAN}http://${CONTROL_PLANE_IP}:${GRAFANA_NODEPORT}${NC}"
     echo -e "    Prometheus   : ${CYAN}http://${CONTROL_PLANE_IP}:${PROMETHEUS_NODEPORT}${NC}"
     echo -e "    Alertmanager : ${CYAN}http://${CONTROL_PLANE_IP}:${ALERTMANAGER_NODEPORT}${NC}"
     echo -e "    Retention    : ${CYAN}${PROM_RETENTION}${NC}  |  Storage: ${CYAN}${PROM_STORAGE_SIZE}${NC}"
   else
-    echo -e "  Monitoring     : $(echo -e ${mon_status})"
+    echo -e "  Monitoring     : $(echo -e "${mon_status}")"
   fi
   if [[ "$INSTALL_NFS" == "true" ]]; then
-    echo -e "  NFS            : $(echo -e ${nfs_status})"
+    echo -e "  NFS            : $(echo -e "${nfs_status}")"
     echo -e "    StorageClass : ${CYAN}${NFS_STORAGE_CLASS}${NC}  (default: ${NFS_DEFAULT_SC})"
   else
-    echo -e "  NFS            : $(echo -e ${nfs_status})"
+    echo -e "  NFS            : $(echo -e "${nfs_status}")"
   fi
   [[ "$INSTALL_NVIDIA" == "true" ]] && \
     echo -e "  GPU Operator   : ${GREEN}✔${NC}  (ns: ${NS_GPU_OPERATOR})"
-  echo -e "  Dashboard      : $(echo -e ${dash_status})"
   if [[ "$INSTALL_DASHBOARD" == "true" ]]; then
+    echo -e "  Dashboard      : $(echo -e "${dash_status}")"
     echo -e "    URL          : ${CYAN}https://${CONTROL_PLANE_IP}:${DASHBOARD_NODEPORT}${NC}"
+  else
+    echo -e "  Dashboard      : $(echo -e "${dash_status}")"
   fi
-  echo -e "  vLLM Stack     : $(echo -e ${vllm_status})"
   if [[ "$INSTALL_VLLM" == "true" ]]; then
+    echo -e "  vLLM Stack     : $(echo -e "${vllm_status}")"
     echo -e "    Router       : ${CYAN}http://${CONTROL_PLANE_IP}:${VLLM_NODEPORT}/v1${NC}"
     echo -e "    Model        : ${CYAN}${VLLM_MODEL}${NC}"
     echo -e "    dtype        : ${CYAN}${VLLM_DTYPE}${NC}  |  ctx: ${CYAN}${VLLM_MAX_MODEL_LEN}${NC} tokens  |  GPUs: ${CYAN}${VLLM_GPU_COUNT}${NC}"
-    if [[ -n "${VLLM_HF_TOKEN:-}" ]]; then
-      echo -e "    HF Token     : ${GREEN}set (hidden)${NC}"
-    else
-      echo -e "    HF Token     : ${YELLOW}not set (public model only)${NC}"
-    fi
+    [[ -n "${VLLM_HF_TOKEN:-}" ]] && echo -e "    HF Token     : ${GREEN}set (hidden)${NC}" || echo -e "    HF Token     : ${YELLOW}not set${NC}"
     if [[ "${VLLM_REUSE_PVC:-false}" == "true" ]]; then
       echo -e "    Storage      : ${CYAN}reuse PVC ${VLLM_PVC_NAME}${NC}"
     else
       echo -e "    Storage      : ${CYAN}new PVC ${VLLM_PVC_NAME} (${VLLM_STORAGE_SIZE})${NC}"
     fi
-    [[ -n "${VLLM_EXTRA_ARGS:-}" ]] && \
-      echo -e "    Extra args   : ${DIM}${VLLM_EXTRA_ARGS}${NC}"
+    [[ -n "${VLLM_EXTRA_ARGS:-}" ]] && echo -e "    Extra args   : ${DIM}${VLLM_EXTRA_ARGS}${NC}"
+  else
+    echo -e "  vLLM Stack     : $(echo -e "${vllm_status}")"
   fi
-
   echo ""
   echo -e "  ${DIM}Config will be saved to: ${CONFIG_FILE}${NC}"
   echo ""
+}
 
-  prompt_yes_no CONFIRMED "Proceed with this configuration?" "y"
-  if [[ "$CONFIRMED" != "true" ]]; then
+confirm_summary() {
+  section_header "Configuration Summary — Review Before Continuing" "10/10"
+
+  while true; do
+    print_summary
+
+    echo -e "  ${BOLD}What would you like to do?${NC}"
+    echo -e "    ${CYAN}y${NC}) Save and continue"
+    echo -e "    ${CYAN}n${NC}) Abort"
+    echo -e "    ${CYAN}1${NC}) Edit SSH & Access"
+    echo -e "    ${CYAN}2${NC}) Edit Cluster Nodes"
+    echo -e "    ${CYAN}3${NC}) Edit Kubernetes Settings"
+    echo -e "    ${CYAN}4${NC}) Edit NVIDIA Drivers"
+    echo -e "    ${CYAN}5${NC}) Edit Monitoring"
+    echo -e "    ${CYAN}6${NC}) Edit NFS Provisioner"
+    echo -e "    ${CYAN}7${NC}) Edit Kubernetes Dashboard"
+    echo -e "    ${CYAN}8${NC}) Edit vLLM Stack"
+    echo -e "    ${CYAN}9${NC}) Edit Namespaces"
+    echo -e "    ${CYAN}p${NC}) Run pre-flight checks"
     echo ""
-    warn_msg "Configuration cancelled. Run the wizard again to reconfigure."
-    exit 0
-  fi
-
-  show_progress
+    echo -ne "  ${BOLD}Choice${NC} ${DIM}[y/n/1-9/p]${NC}: "
+    local choice; read -r choice
+    case "${choice,,}" in
+      y|yes|"") show_progress; return ;;
+      n|no)     echo ""; warn_msg "Configuration cancelled."; exit 0 ;;
+      1) CURRENT_SECTION=0; collect_ssh ;;
+      2) CURRENT_SECTION=1; collect_nodes ;;
+      3) CURRENT_SECTION=2; collect_k8s ;;
+      4) CURRENT_SECTION=3; collect_nvidia ;;
+      5) CURRENT_SECTION=4; collect_monitoring ;;
+      6) CURRENT_SECTION=5; collect_nfs ;;
+      7) CURRENT_SECTION=6; collect_dashboard ;;
+      8) CURRENT_SECTION=7; collect_vllm ;;
+      9) CURRENT_SECTION=8; collect_namespaces ;;
+      p) run_preflight full ;;
+      *) err "Invalid choice." ;;
+    esac
+    section_header "Configuration Summary — Review Before Continuing" "10/10"
+  done
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # WRITE CONFIG FILE
 # ──────────────────────────────────────────────────────────────────────────────
 write_config() {
-  # Escape password for shell safety
   local safe_pw
   safe_pw=$(printf '%q' "$GRAFANA_ADMIN_PASSWORD")
 
   cat > "$CONFIG_FILE" <<CONFEOF
 # =============================================================================
 # k8s_cluster.conf — Generated by k8s_configure.sh on $(date)
+# CONF_VERSION=${CONF_VERSION}
 # =============================================================================
 
 # ── SSH ───────────────────────────────────────────────────────────────────────
@@ -1036,22 +1126,16 @@ CONFEOF
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PATCH INSTALLER WITH CONFIG VALUES
+# PATCH INSTALLER
 # ──────────────────────────────────────────────────────────────────────────────
 patch_installer() {
   if [[ ! -f "$INSTALLER" ]]; then
     warn_msg "Installer not found at ${INSTALLER} — config written but installer not patched."
     return
   fi
-
-  # Read worker IPs for sed (strip parens/quotes, comma-join)
   local worker_arr_str="$WORKER_IPS_STR"
+  local tmp; tmp=$(mktemp)
 
-  # Use a temp file to patch the CONFIGURATION block
-  local tmp
-  tmp=$(mktemp)
-
-  # Replace the static config block between the two marker comments
   awk -v cp="$CONTROL_PLANE_IP" \
       -v wu="$SSH_USER" \
       -v wk="$SSH_KEY_PATH" \
@@ -1103,7 +1187,7 @@ patch_installer() {
    in_conf && /^NFS_SERVER_IP=/     { print "NFS_SERVER_IP=\"" nfs_ip "\""; next }
    in_conf && /^NFS_PATH=/          { print "NFS_PATH=\"" nfs_path "\"";    next }
    in_conf && /^NVIDIA_DRIVER_VERSION=/ { print "NVIDIA_DRIVER_VERSION=\"" nv "\""; next }
-   in_conf && /^NVIDIA_OPEN_KERNEL=/   { print "NVIDIA_OPEN_KERNEL=\"" nv_open "\""; next }
+   in_conf && /^NVIDIA_OPEN_KERNEL=/    { print "NVIDIA_OPEN_KERNEL=\"" nv_open "\""; next }
    in_conf && /^NVIDIA_FABRIC_MANAGER=/ { print "NVIDIA_FABRIC_MANAGER=\"" nv_fm "\""; next }
    in_conf && /^NVIDIA_REBOOT_TIMEOUT=/ { print "NVIDIA_REBOOT_TIMEOUT=\"" nv_rt "\""; next }
    in_conf && /^HELM_VERSION=/      { print "HELM_VERSION=\"" hv "\"";      next }
@@ -1141,7 +1225,7 @@ patch_installer() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# OPTIONAL: LAUNCH INSTALLER
+# OFFER LAUNCH
 # ──────────────────────────────────────────────────────────────────────────────
 offer_launch() {
   echo ""
@@ -1149,11 +1233,38 @@ offer_launch() {
   echo -e "  ${BOLD}  Configuration complete!${NC}"
   echo -e "  ${BOLD}${BLUE}══════════════════════════════════════════════════════════${NC}"
   echo ""
-  echo -e "  To run the installer manually:"
+  echo -e "  To run the ${BOLD}full installer${NC}:"
   echo -e "    ${CYAN}sudo bash ${INSTALLER}${NC}"
   echo ""
-  echo -e "  Or run a single step:"
+  echo -e "  To run a ${BOLD}single step${NC}:"
   echo -e "    ${CYAN}sudo bash ${INSTALLER} --step <step-name>${NC}"
+  echo ""
+  printf "  ${BOLD}%-14s %-18s %s${NC}\n" "Step name" "Aliases" "Phase"
+  echo -e "  ${DIM}──────────────────────────────────────────────────────────${NC}"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "ssh"        ""                    "SSH key setup"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "prep"       "node-prep"            "Node preparation"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "nvidia"     ""                     "NVIDIA drivers"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "k8s-bins"   "k8s bins"             "Kubernetes binaries"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "init"       "control plane"        "Control plane init"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "cni"        "CNI"                  "CNI plugin"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "workers"    "join workers"         "Join worker nodes"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "helm"       "Helm"                 "Install Helm"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "nfs"        "NFS"                  "NFS provisioner"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "monitoring" "prometheus grafana"   "Monitoring stack"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "gpu-op"     "gpu operator"         "GPU Operator"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "dashboard"  "Dashboard"            "Kubernetes Dashboard"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "vllm"       "vLLM vLLM Stack"      "vLLM production stack"
+  printf "  ${CYAN}%-14s${NC} ${DIM}%-18s${NC} %s\n" "verify"     "verification"         "Post-install check"
+  echo ""
+  echo -e "  To ${BOLD}re-run the wizard for a single section${NC}:"
+  echo -e "    ${CYAN}bash ${BASH_SOURCE[0]} --section <name>${NC}"
+  echo -e "    ${DIM}Sections: ssh nodes k8s nvidia monitoring nfs dashboard vllm namespaces${NC}"
+  echo ""
+  echo -e "  To run ${BOLD}pre-flight checks${NC} only:"
+  echo -e "    ${CYAN}bash ${BASH_SOURCE[0]} --preflight${NC}"
+  echo ""
+  echo -e "  To ${BOLD}uninstall${NC} the cluster:"
+  echo -e "    ${CYAN}sudo bash ${INSTALLER} --uninstall${NC}"
   echo ""
 
   if [[ ! -f "$INSTALLER" ]]; then
@@ -1161,10 +1272,10 @@ offer_launch() {
     return
   fi
 
-  prompt_yes_no LAUNCH_NOW "Launch the installer now?" "n"
+  prompt_yes_no LAUNCH_NOW "Launch the full installer now?" "n"
   if [[ "$LAUNCH_NOW" == "true" ]]; then
+    echo ""
     if [[ $EUID -ne 0 ]]; then
-      echo ""
       warn_msg "Re-launching with sudo..."
       exec sudo bash "$INSTALLER"
     else
@@ -1178,7 +1289,7 @@ offer_launch() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RECONFIGURE PROMPT (if config already exists)
+# CHECK EXISTING CONFIG / MIGRATION
 # ──────────────────────────────────────────────────────────────────────────────
 check_existing_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
@@ -1186,55 +1297,200 @@ check_existing_config() {
     echo -e "  ${YELLOW}${SYM_WARN}  An existing configuration was found:${NC}"
     echo -e "  ${DIM}${CONFIG_FILE}${NC}"
     echo ""
-    # Show key values from existing config
     source "$CONFIG_FILE" 2>/dev/null || true
+
+    # Version migration
+    local file_ver="${CONF_VERSION_FILE:-1}"
+    if grep -q "CONF_VERSION=" "$CONFIG_FILE" 2>/dev/null; then
+      file_ver=$(grep "CONF_VERSION=" "$CONFIG_FILE" | head -1 | cut -d= -f2)
+    fi
+    if (( file_ver < CONF_VERSION )); then
+      warn_msg "Config file is version ${file_ver} — current wizard is version ${CONF_VERSION}."
+      hint "New fields will be added with defaults when you reconfigure."
+    fi
+
     echo -e "  ${DIM}Control plane : ${CONTROL_PLANE_IP:-<not set>}${NC}"
+    echo -e "  ${DIM}Workers       : $(echo "${WORKER_IPS[@]:-}" | tr ' ' ',' | sed 's/,$//') ${NC}"
     echo -e "  ${DIM}SSH user      : ${SSH_USER:-<not set>}${NC}"
     echo -e "  ${DIM}K8s version   : ${K8S_VERSION:-<not set>}${NC}"
+    echo -e "  ${DIM}CNI           : ${CNI_PLUGIN:-<not set>}${NC}"
     echo ""
-    prompt_yes_no RECONFIGURE "Reconfigure (overwrite existing config)?" "y"
-    if [[ "$RECONFIGURE" != "true" ]]; then
-      echo ""
-      ok "Keeping existing configuration at ${CONFIG_FILE}."
-      offer_launch
-      exit 0
-    fi
+
+    echo -e "  ${BOLD}Options:${NC}"
+    echo -e "    ${CYAN}r${NC}) Reconfigure (full wizard)"
+    echo -e "    ${CYAN}e${NC}) Edit a single section"
+    echo -e "    ${CYAN}p${NC}) Run pre-flight checks against current config"
+    echo -e "    ${CYAN}s${NC}) Show config and launch installer"
+    echo -e "    ${CYAN}q${NC}) Quit"
     echo ""
+    echo -ne "  ${BOLD}Choice [r/e/p/s/q]${NC}: "
+    local choice; read -r choice
+    case "${choice,,}" in
+      r) echo ""; return ;;   # fall through to full wizard
+      e) run_section_menu ;;
+      p)
+        WORKER_IPS_STR="($(echo "${WORKER_IPS[@]:-}" | tr ' ' '\n' | grep '\.' | sed 's/^/"/' | sed 's/$/" /' | tr -d '\n'))"
+        run_preflight preflight-only
+        offer_launch; exit 0 ;;
+      s)
+        print_header
+        section_header "Current Configuration"
+        WORKER_IPS_STR="($(echo "${WORKER_IPS[@]:-}" | tr ' ' '\n' | grep '\.' | sed 's/^/"/' | sed 's/$/" /' | tr -d '\n'))"
+        print_summary
+        offer_launch; exit 0 ;;
+      q|"") echo ""; ok "Keeping existing configuration."; offer_launch; exit 0 ;;
+      *)    echo ""; return ;;
+    esac
   fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SINGLE-SECTION EDIT MENU
+# ──────────────────────────────────────────────────────────────────────────────
+run_section_menu() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE" 2>/dev/null || true
+    # Rebuild WORKER_IPS_STR from the sourced array
+    local arr_str="("
+    for ip in "${WORKER_IPS[@]:-}"; do [[ -n "$ip" ]] && arr_str+="\"$ip\" "; done
+    arr_str="${arr_str% })"; WORKER_IPS_STR="$arr_str"
+    WORKER_COUNT=$(echo "${WORKER_IPS[@]:-}" | wc -w)
+  fi
+
+  echo ""
+  echo -e "  ${BOLD}Which section do you want to edit?${NC}"
+  echo -e "    ${CYAN}1${NC}) SSH & Access"
+  echo -e "    ${CYAN}2${NC}) Cluster Nodes"
+  echo -e "    ${CYAN}3${NC}) Kubernetes Settings"
+  echo -e "    ${CYAN}4${NC}) NVIDIA Drivers"
+  echo -e "    ${CYAN}5${NC}) Monitoring"
+  echo -e "    ${CYAN}6${NC}) NFS Provisioner"
+  echo -e "    ${CYAN}7${NC}) Kubernetes Dashboard"
+  echo -e "    ${CYAN}8${NC}) vLLM Stack"
+  echo -e "    ${CYAN}9${NC}) Namespaces"
+  echo -ne "  ${BOLD}Choice [1-9]${NC}: "
+  local choice; read -r choice
+  CURRENT_SECTION=0
+  case "$choice" in
+    1) collect_ssh ;;
+    2) collect_nodes ;;
+    3) collect_k8s ;;
+    4) collect_nvidia ;;
+    5) collect_monitoring ;;
+    6) collect_nfs ;;
+    7) collect_dashboard ;;
+    8) collect_vllm ;;
+    9) collect_namespaces ;;
+    *) err "Invalid choice."; run_section_menu; return ;;
+  esac
+  write_config
+  patch_installer
+  offer_launch
+  exit 0
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI ARGUMENT HANDLING
+# ──────────────────────────────────────────────────────────────────────────────
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --section)
+        shift
+        if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE" 2>/dev/null || true; fi
+        local arr_str="("
+        for ip in "${WORKER_IPS[@]:-}"; do [[ -n "$ip" ]] && arr_str+="\"$ip\" "; done
+        arr_str="${arr_str% })"; WORKER_IPS_STR="${arr_str:-()}"
+        WORKER_COUNT=$(echo "${WORKER_IPS[@]:-}" | wc -w)
+        CURRENT_SECTION=0
+        case "${1:-}" in
+          ssh)        collect_ssh ;;
+          nodes)      collect_nodes ;;
+          k8s)        collect_k8s ;;
+          nvidia)     collect_nvidia ;;
+          monitoring) collect_monitoring ;;
+          nfs)        collect_nfs ;;
+          dashboard)  collect_dashboard ;;
+          vllm)       collect_vllm ;;
+          namespaces) collect_namespaces ;;
+          *)
+            err "Unknown section: ${1:-}"
+            echo "  Valid sections: ssh nodes k8s nvidia monitoring nfs dashboard vllm namespaces"
+            exit 1 ;;
+        esac
+        write_config; patch_installer; offer_launch; exit 0 ;;
+
+      --preflight)
+        if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE" 2>/dev/null || true; fi
+        local arr_str="("
+        for ip in "${WORKER_IPS[@]:-}"; do [[ -n "$ip" ]] && arr_str+="\"$ip\" "; done
+        arr_str="${arr_str% })"; WORKER_IPS_STR="${arr_str:-()}"
+        print_header
+        run_preflight preflight-only
+        exit 0 ;;
+
+      --show)
+        if [[ -f "$CONFIG_FILE" ]]; then
+          echo ""
+          echo -e "${BOLD}${CYAN}Current configuration (${CONFIG_FILE}):${NC}"
+          echo ""
+          cat "$CONFIG_FILE"
+        else
+          err "No config file found at ${CONFIG_FILE}"
+          exit 1
+        fi
+        exit 0 ;;
+
+      --help|-h)
+        echo ""
+        echo -e "${BOLD}Usage:${NC}"
+        echo -e "  ${CYAN}bash k8s_configure.sh${NC}                    Full interactive wizard"
+        echo -e "  ${CYAN}bash k8s_configure.sh --section <name>${NC}   Re-run a single section"
+        echo -e "  ${CYAN}bash k8s_configure.sh --preflight${NC}        Pre-flight checks only"
+        echo -e "  ${CYAN}bash k8s_configure.sh --show${NC}             Print current config"
+        echo ""
+        echo -e "${BOLD}Section names:${NC} ssh nodes k8s nvidia monitoring nfs dashboard vllm namespaces"
+        echo ""
+        exit 0 ;;
+
+      *) err "Unknown argument: $1"; exit 1 ;;
+    esac
+    shift
+  done
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
-main() {
-  print_header
-  check_existing_config
-
-  print_header
-  echo -e "  ${DIM}This wizard collects all parameters needed to install your"
-  echo -e "  Kubernetes cluster and saves them to ${CONFIG_FILE}.${NC}"
-  echo -e "  ${DIM}You can abort at any time with Ctrl+C.${NC}"
-  echo ""
-
-  collect_ssh
-  collect_nodes
-  collect_k8s
-  collect_nvidia
-  collect_monitoring
-  collect_nfs
-  collect_dashboard
-  collect_vllm
-  collect_namespaces
-  confirm_summary
-
-  write_config
-  patch_installer
-  offer_launch
-}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CTRL+C handler
-# ──────────────────────────────────────────────────────────────────────────────
 trap 'echo -e "\n\n  ${YELLOW}${SYM_WARN}  Wizard interrupted — no changes saved.${NC}\n"; exit 130' INT
 
-main "$@"
+# Handle CLI flags before the interactive flow
+parse_args "$@"
+
+print_header
+check_existing_config
+print_header
+echo -e "  ${DIM}This wizard collects all parameters needed to install your"
+echo -e "  Kubernetes cluster and saves them to ${CONFIG_FILE}.${NC}"
+echo -e "  ${DIM}You can abort at any time with Ctrl+C.${NC}"
+echo ""
+
+# Initialise WORKER_COUNT so vLLM GPU suggestion works even if collect_nodes
+# is the first section called
+WORKER_COUNT=0
+
+collect_ssh
+collect_nodes
+collect_k8s
+collect_nvidia
+collect_monitoring
+collect_nfs
+collect_dashboard
+collect_vllm
+collect_namespaces
+confirm_summary
+
+write_config
+patch_installer
+run_preflight full
+offer_launch
